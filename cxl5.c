@@ -126,9 +126,9 @@ typedef struct {
 
 Bus previousBusMsg;
 int hasPreviousBusMsg;
-Program program1, program2;
-Cache cache[1], cache2;
-Core core1, core2;
+Program program[2];
+Cache cache[2];
+Core core[2];
 Mem llc;
 Bus snooping_bus;
 Bus response;
@@ -152,25 +152,25 @@ void initialise_bus() {
 }
 
 void TSO() {
-    program1.PC = 0;
-    program1.NumInstructions = 2;
-    program1.instructions[0].type = Write;
-    program1.instructions[0].val = 1;
-    program1.instructions[0].loc = 0;//write x
-    program1.instructions[1].type = Read;
-    program1.instructions[1].val = 1;
-    program1.instructions[1].loc = 1;//read y
-    program1.instructions[1].regNum = 1; //core 1 reads to r1
+    program[0].PC = 0;
+    program[0].NumInstructions = 2;
+    program[0].instructions[0].type = Write;
+    program[0].instructions[0].val = 1;
+    program[0].instructions[0].loc = 0;//write x
+    program[0].instructions[1].type = Read;
+    program[0].instructions[1].val = 1;
+    program[0].instructions[1].loc = 1;//read y
+    program[0].instructions[1].regNum = 1; //core 1 reads to r1
 
-    program2.PC = 0;
-    program2.NumInstructions = 2;
-    program2.instructions[0].type = Write;
-    program2.instructions[0].val = 1; 
-    program2.instructions[0].loc = 1;//write y
-    program2.instructions[1].type = Read;
-    program2.instructions[1].val = 1;
-    program2.instructions[1].loc = 0;//read x
-    program2.instructions[1].regNum = 0; //core 2 reads to r0
+    program[1].PC = 0;
+    program[1].NumInstructions = 2;
+    program[1].instructions[0].type = Write;
+    program[1].instructions[0].val = 1; 
+    program[1].instructions[0].loc = 1;//write y
+    program[1].instructions[1].type = Read;
+    program[1].instructions[1].val = 1;
+    program[1].instructions[1].loc = 0;//read x
+    program[1].instructions[1].regNum = 0; //core 2 reads to r0
 }
 void initialise_mem() {
     llc.blockStates[0] = IorS;
@@ -185,27 +185,27 @@ void initialise_mem() {
 }
 void initialise_cache() {
     //cache 1
+    cache[0].blockStates[0] = Invalid;
+    cache[0].blockStates[1] = Invalid;
+    cache[0].dataBlocks[0][0] = 99;
+    cache[0].dataBlocks[1][0] = 88;
+    //the next 2 lines do not matter 
+    cache[0].dataBlocks[0][1] = 0;
+    cache[0].dataBlocks[1][1] = 0;
+    hasPreviousBusMsg = 0;
+    cache[0].doneOneThing = 0;
+    
+
+    //cache 2
     cache[1].blockStates[0] = Invalid;
     cache[1].blockStates[1] = Invalid;
-    cache[1].dataBlocks[0][0] = 99;
-    cache[1].dataBlocks[1][0] = 88;
+    cache[1].dataBlocks[0][0] = 77;
+    cache[1].dataBlocks[1][0] = 66;
     //the next 2 lines do not matter 
     cache[1].dataBlocks[0][1] = 0;
     cache[1].dataBlocks[1][1] = 0;
     hasPreviousBusMsg = 0;
     cache[1].doneOneThing = 0;
-    
-
-    //cache 2
-    cache2.blockStates[0] = Invalid;
-    cache2.blockStates[1] = Invalid;
-    cache2.dataBlocks[0][0] = 77;
-    cache2.dataBlocks[1][0] = 66;
-    //the next 2 lines do not matter 
-    cache2.dataBlocks[0][1] = 0;
-    cache2.dataBlocks[1][1] = 0;
-    hasPreviousBusMsg = 0;
-    cache2.doneOneThing = 0;
 
 
 }
@@ -219,515 +219,260 @@ void cache_deal_OwnGetS(int id) {
 void cache_deal_OtherGetS(int id) {
     int thisBlock;
     int requestor;
-    if(id == 1) {
-        thisBlock = previousBusMsg.whichBlock;
-        switch (cache[1].blockStates[thisBlock])
-        {
-        case Invalid:
-            //ignore
-            break;
-        case Shared:
-            break; //ignore
-        case Modified:
-            //downgrade to shared state, send data to requestor and mem
-            cache[1].blockStates[thisBlock] = Shared;
-            requestor = previousBusMsg.sender;
-            response.type = Data;
-            response.payload[0] = cache[1].dataBlocks[thisBlock][0];
-            response.payload[1] = cache[1].dataBlocks[thisBlock][1];
-            response.receiver = requestor;
-            response.toMem = 1; //also write back to cache
-            response.sender = id;
-            response.whichBlock = thisBlock;
-            isIssuingResponse = 1;
-            cache[1].doneOneThing = 1;
-            break;
-        default:
-            NONPROD_ASSERT(0, "AT, should never be in transient states when another processor is issuing coherence request");
-            break;
-        }
+    thisBlock = previousBusMsg.whichBlock;
+    switch (cache[id - 1].blockStates[thisBlock])
+    {
+    case Invalid:
+        //ignore
+        break;
+    case Shared:
+        break; //ignore
+    case Modified:
+        //downgrade to shared state, send data to requestor and mem
+        cache[id - 1].blockStates[thisBlock] = Shared;
+        requestor = previousBusMsg.sender;
+        response.type = Data;
+        response.payload[0] = cache[id - 1].dataBlocks[thisBlock][0];
+        response.payload[1] = cache[id - 1].dataBlocks[thisBlock][1];
+        response.receiver = requestor;
+        response.toMem = 1; //also write back to cache
+        response.sender = id;
+        response.whichBlock = thisBlock;
+        isIssuingResponse = 1;
+        cache[id - 1].doneOneThing = 1;
+        break;
+    default:
+        NONPROD_ASSERT(0, "AT, should never be in transient states when another processor is issuing coherence request");
+        break;
     }
-    if(id == 2) {
-        thisBlock = previousBusMsg.whichBlock;
-        switch (cache2.blockStates[thisBlock])
-        {
-        case Invalid:
-            //ignore
-            break;
-        case Shared:
-            break; //ignore
-        case Modified:
-            //downgrade to shared state, send data to requestor and mem
-            cache2.blockStates[thisBlock] = Shared;
-            requestor = previousBusMsg.sender;
-            response.type = Data;
-            response.payload[0] = cache2.dataBlocks[thisBlock][0];
-            response.payload[1] = cache2.dataBlocks[thisBlock][1];
-            response.receiver = requestor;
-            response.toMem = 1; //also write back to cache
-            response.sender = id;
-            response.whichBlock = thisBlock;
-            cache2.doneOneThing = 1;
-            isIssuingResponse = 1;
-            break;
-        default:
-            NONPROD_ASSERT(0, "AT, should never be in transient states");
-            break;
-        }
-    }
-
 }
+
 void cache_deal_OtherGetM(int id) {
     int thisBlock;
-    
     int requestor;
-    if(id == 1) {
-        thisBlock = previousBusMsg.whichBlock;
-        switch (cache[1].blockStates[thisBlock])
-        {
-        case Invalid:
-            //ignore
-            break;
-        case Shared:
-            cache[1].blockStates[thisBlock] = Invalid;
-            break; 
-        case Modified:
-            //downgrade to shared state, send data to requestor and mem
-            cache[1].blockStates[thisBlock] = Invalid;
-            requestor = previousBusMsg.sender;
-            response.type = Data;
-            response.payload[0] = cache[1].dataBlocks[thisBlock][0];
-            response.payload[1] = cache[1].dataBlocks[thisBlock][1];
-            response.receiver = requestor;
-            response.toMem = 0; //ownership goes to another cache
-            response.sender = id;
-            response.whichBlock = thisBlock;
-            cache[1].doneOneThing = 1;
-            isIssuingResponse = 1;
-            break;
-        default:
-            NONPROD_ASSERT(0, "AT, should never be in transient states");
-            break;
-        }
-    }
-    if(id == 2) {
-        thisBlock = previousBusMsg.whichBlock;
-        switch (cache2.blockStates[thisBlock])
-        {
-        case Invalid:
-            //ignore
-            break;
-        case Shared:
-            cache2.blockStates[thisBlock] = Invalid;
-            break; 
-        case Modified:
-            //downgrade to shared state, send data to requestor and mem
-            cache2.blockStates[thisBlock] = Invalid;
-            requestor = previousBusMsg.sender;
-            response.type = Data;
-            response.payload[0] = cache2.dataBlocks[thisBlock][0];
-            response.payload[1] = cache2.dataBlocks[thisBlock][1];
-            response.receiver = requestor;
-            response.toMem = 0; //ownership goes to another cache
-            response.sender = id;
-            response.whichBlock = thisBlock;
-            cache2.doneOneThing = 1;
-            isIssuingResponse = 1;
-            break;
-        default:
-            NONPROD_ASSERT(0, "AT, should never be in transient states");
-            break;
-        }
+    thisBlock = previousBusMsg.whichBlock;
+    switch (cache[id - 1].blockStates[thisBlock])
+    {
+    case Invalid:
+        //ignore
+        break;
+    case Shared:
+        cache[id - 1].blockStates[thisBlock] = Invalid;
+        break; 
+    case Modified:
+        //downgrade to shared state, send data to requestor and mem
+        cache[id - 1].blockStates[thisBlock] = Invalid;
+        requestor = previousBusMsg.sender;
+        response.type = Data;
+        response.payload[0] = cache[id - 1].dataBlocks[thisBlock][0];
+        response.payload[1] = cache[id - 1].dataBlocks[thisBlock][1];
+        response.receiver = requestor;
+        response.toMem = 0; //ownership goes to another cache
+        response.sender = id;
+        response.whichBlock = thisBlock;
+        cache[id - 1].doneOneThing = 1;
+        isIssuingResponse = 1;
+        break;
+    default:
+        NONPROD_ASSERT(0, "AT, should never be in transient states");
+        break;
     }
 }
+
 void cache_deal_OwnGetM(int id) {
     return; //ignore since my own transaction
 }
 void cache_deal_OwnPutM(int id) {
-    if(id == 1) {
-        ;//I have sent out PutM, now follow-up with Data message
-    }
+    return;
 }
 void core_deal_with_previous_bus_msg(int id) {
-    PRINT2("%d, %d\n", hasPreviousBusMsg, previousBusMsg.type);
     int thisBlock;
     Instruction pending;
-    if(id == 1) {
-        thisBlock = previousBusMsg.whichBlock;
-        if(hasPreviousBusMsg){
-            switch (previousBusMsg.type)
-            {
-            case GetS:
-                if(previousBusMsg.sender == id)
-                    cache_deal_OwnGetS(id);
-                else 
-                    cache_deal_OtherGetS(id);
-                break;
-            case GetM:
-                if(previousBusMsg.sender == id)
-                    cache_deal_OwnGetM(id);
-                else
-                    cache_deal_OtherGetM(id);
-                break;
-            case PutM:
-                ; //ignore because already processed
-                break;
-            case Data:
-                //copy data into cache
-                if(previousBusMsg.receiver != id)
-                    break;
-                PRINT("smoke after break %d \n", thisBlock);
-                cache[1].dataBlocks[thisBlock][0] = previousBusMsg.payload[0];
-                cache[1].dataBlocks[thisBlock][1] = previousBusMsg.payload[1];
-                cache[1].doneOneThing = 1;
-                transactionInProgress = 0;
-                core1.Stalled = 0;
-                core2.Stalled = 0;
-                pending = core1.pendingInstruction;
-                
-                switch(cache[1].blockStates[thisBlock]) {
-                    case ISD:
-                        
-                        cache[1].blockStates[thisBlock] = Shared;
-                        //& complete previous instruction load
-                        core1.registers[pending.regNum] = cache[1].dataBlocks[thisBlock][0];
-                        NONPROD_ASSERT(thisBlock == pending.loc, "Data block id should be the same as the read instruction's read location");
-                        break;
-                    case IMD:
-                        cache[1].blockStates[thisBlock] = Modified;
-                        //& complete previous instruction store
-                        cache[1].dataBlocks[thisBlock][0] = pending.val;
-                        PRINT2("block %d has value %d now\n", thisBlock, pending.val);
-                        break;
-                    case SMD:
-                        cache[1].blockStates[thisBlock] = Modified;
-                        //& complete previous instruction store
-                        cache[1].dataBlocks[thisBlock][0] = pending.val;
-                        break;
-                    default:
-                        NONPROD_ASSERT(0, "received data for me while in transient state");
-                        break;
-                }
-                break;                        
-            default:
-                NONPROD_ASSERT(0, "unclassified msg type");
-                break;
-            }
-        }
-        return;
-    }
-    if(id == 2) {
-        thisBlock = previousBusMsg.whichBlock;
-        if(hasPreviousBusMsg){
-            switch (previousBusMsg.type)
-            {
-            case GetS:
-                if(previousBusMsg.sender == id)
-                    cache_deal_OwnGetS(id);
-                else 
-                    cache_deal_OtherGetS(id);
-                break;
-            case GetM:
-                if(previousBusMsg.sender == id)
-                    cache_deal_OwnGetM(id);
-                else
-                    cache_deal_OtherGetM(id);
-                break;
-            case PutM:
-                ; //ignore because already processed
-                break;
-            case Data:
-                //copy data into cache
 
-                // NONPROD_ASSERT(0, "smoke DATA core 2");
-
-                if(previousBusMsg.receiver != id)
-                    break;
-                // NONPROD_ASSERT(0, "smoke DATA core 2 *");
-                cache2.dataBlocks[thisBlock][0] = previousBusMsg.payload[0];
-                cache2.dataBlocks[thisBlock][1] = previousBusMsg.payload[1];
-                cache2.doneOneThing = 1;
-                transactionInProgress = 0;
-                core1.Stalled = 0; //unstall both cores
-                core2.Stalled = 0;
-                pending = core2.pendingInstruction;
-                switch(cache2.blockStates[thisBlock]) {
-                    case ISD:
-                        cache2.blockStates[thisBlock] = Shared;
-                        core2.registers[pending.regNum] = cache2.dataBlocks[thisBlock][0];
-                        break;
-                    case IMD:
-                        cache2.blockStates[thisBlock] = Modified;
-                        //& complete previous instruction store
-                        cache2.dataBlocks[thisBlock][0] = pending.val;
-                        break;
-                    case SMD:
-                        cache2.blockStates[thisBlock] = Modified;
-                        //& complete previous instruction store
-                        cache2.dataBlocks[thisBlock][0] = pending.val;
-                        break;
-                    default:
-                        NONPROD_ASSERT(0, "core 2 received data for me while in transient state");
-                        break;
-                }
-                break;                        
-            default:
-                NONPROD_ASSERT(0, "unclassified msg type");
+    thisBlock = previousBusMsg.whichBlock;
+    if(hasPreviousBusMsg){
+        switch (previousBusMsg.type)
+        {
+        case GetS:
+            if(previousBusMsg.sender == id)
+                cache_deal_OwnGetS(id);
+            else 
+                cache_deal_OtherGetS(id);
+            break;
+        case GetM:
+            if(previousBusMsg.sender == id)
+                cache_deal_OwnGetM(id);
+            else
+                cache_deal_OtherGetM(id);
+            break;
+        case PutM:
+            ; //ignore because already processed
+            break;
+        case Data:
+            //copy data into cache
+            if(previousBusMsg.receiver != id)
                 break;
+            PRINT("smoke after break %d \n", thisBlock);
+            cache[id - 1].dataBlocks[thisBlock][0] = previousBusMsg.payload[0];
+            cache[id - 1].dataBlocks[thisBlock][1] = previousBusMsg.payload[1];
+            cache[id - 1].doneOneThing = 1;
+            transactionInProgress = 0;
+            core[0].Stalled = 0;
+            core[1].Stalled = 0;
+            pending = core[id - 1].pendingInstruction;
+            
+            switch(cache[id - 1].blockStates[thisBlock]) {
+                case ISD:
+                    cache[id - 1].blockStates[thisBlock] = Shared;
+                    //& complete previous instruction load
+                    core[id - 1].registers[pending.regNum] = cache[id - 1].dataBlocks[thisBlock][0];
+                    NONPROD_ASSERT(thisBlock == pending.loc, "Data block id should be the same as the read instruction's read location");
+                    break;
+                case IMD:
+                    cache[id - 1].blockStates[thisBlock] = Modified;
+                    //& complete previous instruction store
+                    cache[id - 1].dataBlocks[thisBlock][0] = pending.val;
+                    PRINT2("block %d has value %d now\n", thisBlock, pending.val);
+                    break;
+                case SMD:
+                    cache[id - 1].blockStates[thisBlock] = Modified;
+                    //& complete previous instruction store
+                    cache[id - 1].dataBlocks[thisBlock][0] = pending.val;
+                    break;
+                default:
+                    NONPROD_ASSERT(0, "received data for me while in transient state");
+                    break;
             }
+            break;                        
+        default:
+            NONPROD_ASSERT(0, "unclassified msg type");
+            break;
         }
-        return;
     }
 }
+
 void update_PC(int id) {
-    if(id == 1) {
-        if (!core1.Stalled && program1.PC <= program1.NumInstructions ){
-            program1.PC++;
-        }
-    }
-    if(id == 2) {
-        if (!core2.Stalled && program2.PC <= program2.NumInstructions) {
-            program2.PC++;
-        }
+    if (!core[id - 1].Stalled && program[id - 1].PC <= program[id - 1].NumInstructions) {
+        program[id - 1].PC++;
     }
 }
 
 int early_terminate(int id) {
-    if(id == 1) {
-        return cache[1].doneOneThing;
-    }
-    else {
-        return cache2.doneOneThing;
-    }
+    return cache[id - 1].doneOneThing;
 }
 void compose_PutMData(int id) {
     isIssuingResponse = 1;
     response.type = Data;
     int blockId;
-    if(id == 1){
-        blockId = core1.pendingInstruction.loc;
-        response.payload[0] = cache[1].dataBlocks[blockId][0];
-        response.payload[1] = cache[1].dataBlocks[blockId][1];
-        response.receiver = 0; //no cores receive this data
-        response.toMem = 1; //for memory
-        response.sender = id;
-        response.whichBlock = blockId;//TODO: needs to be updated
-    }
-    else {
-        blockId = core2.pendingInstruction.loc;
-        response.payload[0] = cache2.dataBlocks[blockId][0];
-        response.payload[1] = cache2.dataBlocks[blockId][1];
-        response.receiver = 0; //no cores receive this data
-        response.toMem = 1; //for memory
-        response.sender = id;
-        response.whichBlock = blockId;//TODO: needs to be updated
-    }
+    blockId = core[id - 1].pendingInstruction.loc;
+    response.payload[0] = cache[id - 1].dataBlocks[blockId][0];
+    response.payload[1] = cache[id - 1].dataBlocks[blockId][1];
+    response.receiver = 0; //no cores receive this data
+    response.toMem = 1; //for memory
+    response.sender = id;
+    response.whichBlock = blockId;//TODO: needs to be updated
 }
 void execute_instruction(int id) {
     Instruction instr;
-    if(id == 1) {
-        if(core1.Stalled || program1.PC >= program1.NumInstructions ) {
-            ;//keep stalling, stalled by other cores' coherence transactions
-        }
-        else {//take instruction to execute
-            instr = program1.instructions[program1.PC];
-            switch(instr.type) {
-                case Read:
-                    switch (cache[1].blockStates[instr.loc])
-                    {
-                    case Invalid:
-                        
-                        core1.pendingInstruction = instr;
-                        if(transactionInProgress) {//disallow PC to move to next instruction
-                            core1.Stalled = 1;       
-                        }
-                        else {
-                            cache[1].blockStates[instr.loc] = ISD;
-                            request.type = GetS;
-                            request.sender = id;
-                            request.whichBlock = instr.loc;
-                            isIssuingRequest = id;
-                            transactionInProgress = id;
-                            core1.Stalled = 1;
-                        }
-                        break;
-                    case Shared:
-                        core1.registers[instr.regNum] = cache[1].dataBlocks[instr.loc][0];
-                        break;
-                    case Modified:
-                        core1.registers[instr.regNum] = cache[1].dataBlocks[instr.loc][0];
-                        break;
-                    default://TODO: Allow SMD to hit
-                        NONPROD_ASSERT(0, "atomic transaction violated");
-                        break;
-                    }
-                    break;
-                case Write:
+    if(core[id - 1].Stalled || program[id - 1].PC >= program[id - 1].NumInstructions ) {
+        ;//keep stalling, stalled by other cores' coherence transactions
+    }
+    else {//take instruction to execute
+        instr = program[id - 1].instructions[program[id - 1].PC];
+        switch(instr.type) {
+            case Read:
+                switch (cache[id - 1].blockStates[instr.loc])
+                {
+                case Invalid:
                     
-                    switch (cache[1].blockStates[instr.loc])
-                    {
-                    case Invalid:
-                        core1.pendingInstruction = instr;
-                        if(transactionInProgress) {
-                            core1.Stalled = 1;
-                            
-                        }
-                        else {
-                            cache[1].blockStates[instr.loc] = IMD;
-                            request.type = GetM;
-                            request.sender = id;
-                            request.whichBlock = instr.loc;
-                            isIssuingRequest = id;
-                            transactionInProgress = id;
-                            core1.Stalled = 1;
-                        }
-                        break;
-                    case Shared:
-                        core1.pendingInstruction = instr;
-                        if(transactionInProgress) {
-                            core1.Stalled = 1;
-                            
-                        }
-                        else {
-                            cache[1].blockStates[instr.loc] = SMD;
-                            request.type = GetM;
-                            request.sender = id;
-                            request.whichBlock = instr.loc;
-                            isIssuingRequest = id;
-                            transactionInProgress = id;
-                            core1.Stalled = 1;
-                        }
-                        break;
-                    case Modified:
-                        cache[1].dataBlocks[instr.loc][0] = instr.val;
-                        break;
-                    default:
-                        break;
+                    core[id - 1].pendingInstruction = instr;
+                    if(transactionInProgress) {//disallow PC to move to next instruction
+                        core[id - 1].Stalled = 1;       
                     }
-                    break;
-                case Evict:
-                    core1.pendingInstruction = instr;
-                    if(transactionInProgress) {
-                        core1.Stalled = 1;
-                    }
-                    else {//issue PutM request, set transactionInProgress
-                        request.type = PutM;
+                    else {
+                        cache[id - 1].blockStates[instr.loc] = ISD;
+                        request.type = GetS;
                         request.sender = id;
                         request.whichBlock = instr.loc;
                         isIssuingRequest = id;
-                        core1.Stalled = 1;
                         transactionInProgress = id;
-                        cache[1].blockStates[instr.loc] = Invalid;
+                        core[id - 1].Stalled = 1;
                     }
                     break;
-                default:
-                    NONPROD_ASSERT(instr.type, "undef instruction type");
+                case Shared:
+                    core[id - 1].registers[instr.regNum] = cache[id - 1].dataBlocks[instr.loc][0];
                     break;
-            }
-        }
-    }
-
-    if(id == 2) {
-        if(core2.Stalled || program2.PC >= program2.NumInstructions) {
-        }
-        else {//take instruction to execute
-            instr = program2.instructions[program2.PC];
-            switch(instr.type) {
-                case Read:
-                    switch (cache2.blockStates[instr.loc])
-                    {
-                    case Invalid:
-                        core2.pendingInstruction = instr;
-                        if(transactionInProgress) {//disallow PC to move to next instruction
-                            core2.Stalled = 1;
-                        }
-                        else {
-                            cache2.blockStates[instr.loc] = ISD;
-                            request.type = GetS;
-                            request.sender = id;
-                            request.whichBlock = instr.loc;
-                            isIssuingRequest = id;
-                            transactionInProgress = id;
-                            core2.Stalled = 1;
-                            PRINT("cache 2 requesting %d read access \n", instr.loc);
-                        }
-                        break;
-                    case Shared:
-                        core2.registers[instr.regNum] = cache2.dataBlocks[instr.loc][0];
-                        break;
-                    case Modified:
-                        core2.registers[instr.regNum] = cache2.dataBlocks[instr.loc][0];
-                        break;
-                    default://TODO: Allow SMD to hit
-                        NONPROD_ASSERT(0, "atomic transaction violated");
-                        break;
-                    }
+                case Modified:
+                    core[id - 1].registers[instr.regNum] = cache[id - 1].dataBlocks[instr.loc][0];
                     break;
-                case Write:
-                    switch (cache2.blockStates[instr.loc])
-                    {
-                    case Invalid:
-                        core2.pendingInstruction = instr;
-                        if(transactionInProgress) {
-                            core2.Stalled = 1;
-                        }
-                        else {
-                            cache2.blockStates[instr.loc] = IMD;
-                            request.type = GetM;
-                            request.sender = id;
-                            request.whichBlock = instr.loc;
-                            isIssuingRequest = id;
-                            transactionInProgress = id;
-                            core2.Stalled = 1;
-                        }
-                        break;
-                    case Shared:
-                        core2.pendingInstruction = instr;
-                        if(transactionInProgress) {
-                            core2.Stalled = 1;
-                        }
-                        else {
-                            cache2.blockStates[instr.loc] = SMD;
-                            request.type = GetM;
-                            request.sender = id;
-                            request.whichBlock = instr.loc;
-                            isIssuingRequest = id;
-                            transactionInProgress = id;
-                            core2.Stalled = 1;
-                        }
-                        break;
-                    case Modified:
-                        cache2.dataBlocks[instr.loc][0] = instr.val;
-                        break;
-                    default:
-                        break;
-                    }
+                default://TODO: Allow SMD to hit
+                    NONPROD_ASSERT(0, "atomic transaction violated");
                     break;
-                case Evict:
-                    core2.pendingInstruction = instr;
+                }
+                break;
+            case Write:
+                switch (cache[id - 1].blockStates[instr.loc])
+                {
+                case Invalid:
+                    core[id - 1].pendingInstruction = instr;
                     if(transactionInProgress) {
-                        core2.Stalled = 1;
+                        core[id - 1].Stalled = 1;
                     }
-                    else {//issue PutM request, set transactionInProgress
-                        request.type = PutM;
+                    else {
+                        cache[id - 1].blockStates[instr.loc] = IMD;
+                        request.type = GetM;
                         request.sender = id;
                         request.whichBlock = instr.loc;
                         isIssuingRequest = id;
-                        core2.Stalled = 1;
                         transactionInProgress = id;
-                        cache2.blockStates[instr.loc] = Invalid;
+                        core[id - 1].Stalled = 1;
                     }
                     break;
-                default:
-                    NONPROD_ASSERT(0, "unrecognised instruction type");
+                case Shared:
+                    core[id - 1].pendingInstruction = instr;
+                    if(transactionInProgress) {
+                        core[id - 1].Stalled = 1;
+                    }
+                    else {
+                        cache[id - 1].blockStates[instr.loc] = SMD;
+                        request.type = GetM;
+                        request.sender = id;
+                        request.whichBlock = instr.loc;
+                        isIssuingRequest = id;
+                        transactionInProgress = id;
+                        core[id - 1].Stalled = 1;
+                    }
                     break;
-            }
+                case Modified:
+                    cache[id - 1].dataBlocks[instr.loc][0] = instr.val;
+                    break;
+                default:
+                    break;
+                }
+                break;
+            case Evict:
+                core[id - 1].pendingInstruction = instr;
+                if(transactionInProgress) {
+                    core[id - 1].Stalled = 1;
+                }
+                else {//issue PutM request, set transactionInProgress
+                    request.type = PutM;
+                    request.sender = id;
+                    request.whichBlock = instr.loc;
+                    isIssuingRequest = id;
+                    core[id - 1].Stalled = 1;
+                    transactionInProgress = id;
+                    cache[id - 1].blockStates[instr.loc] = Invalid;
+                }
+                break;
+            default:
+                NONPROD_ASSERT(instr.type, "undef instruction type");
+                break;
         }
     }
-
 }
+
 void core_reacts(int id) {
-    
     core_deal_with_previous_bus_msg(id);
     if(transactionInProgress == id) {
         if(snooping_bus.type == PutM) { //TOCHECK: last cycle was evict
@@ -782,25 +527,22 @@ void cores_react() {
 #endif
 
 void initialise_cores() {
-    core1.Stalled = 0;
-    core2.Stalled = 0;
+    core[0].Stalled = 0;
+    core[1].Stalled = 0;
 }
 
 void save_current_msg_for_next_cycle() {
     if(snooping_bus.type != Idle) {
         hasPreviousBusMsg = 1;
         previousBusMsg = snooping_bus;
-        //NONPROD_ASSERT(previousBusMsg.type != GetM, "Data never on bus?");
     }
     else {
         hasPreviousBusMsg = 0;
-        //clear bus message? Or leave it as it is?
     }
     snooping_bus.type = Idle;
 }
 
 void update_bus_msg_for_next_cycle(){
-    // NONPROD_ASSERT(!(isIssuingRequest && isIssuingResponse), "cannot be issuing two to bus");
     if(isIssuingRequest){
         snooping_bus = request;
         isIssuingRequest = 0;
@@ -842,7 +584,6 @@ void mem_react() {
             }
             break;
         case GetM:
-            PRINT("GetM to process with block state: %d\n", llc.blockStates[blockId]);
             switch(llc.blockStates[blockId]) 
             {
             case IorS:
@@ -874,8 +615,8 @@ void mem_react() {
                 llc.dataBlocks[blockId][0] = previousBusMsg.payload[0];
                 llc.dataBlocks[blockId][1] = previousBusMsg.payload[1];
                 //transactionInProgress = 0;
-                core1.Stalled = 0;
-                core2.Stalled = 0;
+                core[0].Stalled = 0;
+                core[1].Stalled = 0;
             }
             break;
         default://TOTEST: should not be idle since hasPrevious... is nonzero
@@ -913,17 +654,17 @@ int main() {
         PRINT2("Who sent message: %d, for which block: %d (0-X, 1-Y), ", previousBusMsg.sender, previousBusMsg.whichBlock);
         PRINT("For whom: %d \n", previousBusMsg.receiver);
         update_bus_msg_for_next_cycle();
-        if(program1.PC >= program1.NumInstructions && program2.PC >= program2.NumInstructions && !core1.Stalled && !core2.Stalled && !transactionInProgress)
+        if(program[0].PC >= program[0].NumInstructions && program[1].PC >= program[1].NumInstructions && !core[0].Stalled && !core[1].Stalled && !transactionInProgress)
             break;
         
         cycle++;
     }
 
 
-    IMPORTANT_ASSERT(!(core1.registers[1] == 0 && core2.registers[0] == 0), "Cannot happen: r1 read 0, and r0 read 0");
-    IMPORTANT_ASSERT(!(core1.registers[1] == 0 && core2.registers[0] == 1), "Should fail on a non-deterministic run: legal outcome r1 (core 1's r1 loaded Y's value) = 0, r0 = 1");
-    IMPORTANT_ASSERT(!(core1.registers[1] == 1 && core2.registers[0] == 0), "Should fail on a nondet check: legal out come r1 = 1, r0 = 0");
-    IMPORTANT_ASSERT(!(core1.registers[1] == 1 && core2.registers[0] == 1), "Should fail on a non-det check: legal outcome r1 = 1, r0 = 1");
+    IMPORTANT_ASSERT(!(core[0].registers[1] == 0 && core[1].registers[0] == 0), "Cannot happen: r1 read 0, and r0 read 0");
+    IMPORTANT_ASSERT(!(core[0].registers[1] == 0 && core[1].registers[0] == 1), "Should fail on a non-deterministic run: legal outcome r1 (core 1's r1 loaded Y's value) = 0, r0 = 1");
+    IMPORTANT_ASSERT(!(core[0].registers[1] == 1 && core[1].registers[0] == 0), "Should fail on a nondet check: legal out come r1 = 1, r0 = 0");
+    IMPORTANT_ASSERT(!(core[0].registers[1] == 1 && core[1].registers[0] == 1), "Should fail on a non-det check: legal outcome r1 = 1, r0 = 1");
   
 
     //random reads and write
