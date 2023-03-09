@@ -1029,8 +1029,11 @@ void DCOH_acts(Cluster * cluster, int id) {
             printf("Idle: %d, External: %d, fromHA %d\n", cluster->snooping_bus.type, cluster->snooping_bus.External, cluster->snooping_bus.fromHA);
             return; //DA only acts if bus message is external message, and the message is flowing from cluster to HA, not from HA
         } 
-        if(DCOH2[blockId] == MESI_E || DCOH2[blockId] == MESI_M)
+        if(DCOH2[blockId] == MESI_E || DCOH2[blockId] == MESI_M){
+            printf("returned\n");
             return; //when cluster has high privilige access, resolve internal coherence messages within cluster, no need to notify host
+
+        }
         //deal with message on snooping bus
         switch(cluster->snooping_bus.type) {
             case GetS:
