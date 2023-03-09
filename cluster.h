@@ -14,7 +14,7 @@ int nondet();
 #define IMPORTANT_ASSERT(E, M) __CPROVER_assert(E, M)
 #ifdef PRODUCTION
 #define NONPROD_ASSERT(E,M)
-#define NONPROD_ASSUME(B)  
+#define NONPROD_ASSUME(B)
 #define PRINT(M, VAR) 
 #define PRINT2(M, VAR1, VAR2)
 #define PRINT0(M)
@@ -63,9 +63,37 @@ typedef enum {
     Idle,
     GetS,
     GetM,
+    GetCurrent,
     PutM,
     Data,
+    GO_CXL,
+    
+    GO_M,
+    GO_E,
+    GO_S,
+    GO_I,
 } BusEventType;
+
+
+typedef struct {
+    InstructionType type;
+    int val;
+    int loc;
+    int regNum;
+    int external;
+} Instruction;
+
+typedef struct {
+    int PC;
+    int NumInstructions;
+    Instruction instructions[MAX_INSTRUCTIONS];
+} Program;
+
+typedef struct {
+    int Stalled;
+    Instruction pendingInstruction;
+    int registers[10];
+} Core;
 
 typedef enum {
     IorS,
@@ -82,26 +110,6 @@ typedef enum {
     SMD,
 } CacheBlockStateTypes;
 
-typedef struct {
-    InstructionType type;
-    int val;
-    int loc;
-    int regNum;
-} Instruction;
-
-typedef struct {
-    int PC;
-    int NumInstructions;
-    Instruction instructions[MAX_INSTRUCTIONS];
-} Program;
-
-typedef struct {
-    int Stalled;
-    Instruction pendingInstruction;
-    int registers[10];
-} Core;
-
-
 
 typedef struct {
     int dataBlocks[MAX_BLOCKS][BYTES_PER_BLOCK];
@@ -115,11 +123,15 @@ typedef struct {
     int toMem;
     int sender;
     int whichBlock;
+    int External; //1->Home agent memory 0-> cluster memory
+    int fromHA;
 } Bus;
 
 typedef struct {
     int dataBlocks[MAX_BLOCKS][BYTES_PER_BLOCK];
+    int externalBlocks[MAX_BLOCKS][BYTES_PER_BLOCK];
     CacheBlockStateTypes blockStates[MAX_BLOCKS];
+    CacheBlockStateTypes externalStates[MAX_BLOCKS];
     int doneOneThing;
 } Cache;
 
@@ -138,6 +150,30 @@ typedef struct {
     int transactionInProgress;
     int cycle;
 } Cluster;
+
+typedef enum {
+    MESI_I,
+    MESI_S,
+    MESI_M,
+    MESI_E,
+} HABlockTypes;
+
+
+
+typedef struct {
+    HABlockTypes typeToGive;
+    int CQID;
+    int blockNum;
+    int requestorCore;
+    int requestorCluster;
+    int DataArrivedBeforeGO;
+
+} Tracker;
+
+
+Tracker  cluster1Trackers[5], cluster2Trackers[5], HomeTrackers[10];
+int trackersCount1, trackersCount2, trackersCountHome;
+
 
 void core_reacts(int id, Cluster * cluster);
 void initialise_cores(Cluster * cluster);
@@ -163,7 +199,7 @@ void initialise_bus(Cluster * cluster) {
 
 }
 
-void TSO(Cluster * cluster) {
+void TSO_single_cluster(Cluster * cluster) {
     cluster->program1.PC = 0;
     cluster->program1.NumInstructions = 2;
     cluster->program1.instructions[0].type = Write;
@@ -221,6 +257,13 @@ void initialise_cache(Cluster * cluster) {
 
 
 }
+void initialise_program_memory(Cluster * cluster) {
+    cluster->program1.PC = 0;
+    cluster->program2.PC = 0;
+    cluster->program1.NumInstructions = 0;
+    cluster->program2.NumInstructions = 0;
+
+}
 
 void initialise_cluster(Cluster * cluster) {
     initialise_cluster_misc(cluster);
@@ -228,6 +271,7 @@ void initialise_cluster(Cluster * cluster) {
     initialise_mem(cluster);
     initialise_cache(cluster);
     initialise_cores(cluster);
+    initialise_program_memory(cluster);
 }
 
 void cache_deal_OwnGetS(int id, Cluster * cluster) {
@@ -370,10 +414,356 @@ void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
     // PRINT2("%d, %d\n", cluster->hasPreviousBusMsg, cluster->previousBusMsg.type);
     int thisBlock;
     Instruction pending;
+    int trackerId;
+    thisBlock = cluster->previousBusMsg.whichBlock;
     if(id == 1) {
-        thisBlock = cluster->previousBusMsg.whichBlock;
         if(cluster->hasPreviousBusMsg){
-            switch (cluster->previousBusMsg.type)
+            if(cluster->previousBusMsg.External == 1) {
+                //this message is about a communication to the HA
+                printf("got previous external bus message\n");
+                switch(cluster->previousBusMsg.type)
+                {
+                case GetS:
+                    if(cluster->previousBusMsg.fromHA) {//if bus message from HA, reply with data
+                        switch(cluster->cache1.externalStates[thisBlock]) {
+                            case Invalid:
+                                break; //ignore, i don't have a copy
+                            case Shared:
+                                cluster->isIssuingResponse = 1;
+                                cluster->response.External = 1;
+                                cluster->response.fromHA = 0;
+                                cluster->response.sender = 1; //cluster 1
+                                cluster->response.toMem = 0;
+                                cluster->response.receiver = 0; //indicating to Host, not to other cores
+                                cluster->response.whichBlock = thisBlock;
+                                cluster->response.payload[0] = cluster->cache1.externalBlocks[thisBlock][0];
+                                cluster->response.payload[1] = cluster->cache1.externalBlocks[thisBlock][1];
+
+                                break;
+                            case Modified:
+
+                                cluster->isIssuingResponse = 1;
+                                cluster->response.External = 1;
+                                cluster->response.fromHA = 0;
+                                cluster->response.sender = 1; //cluster 1
+                                cluster->response.toMem = 0;
+                                cluster->response.receiver = 0; //indicating to host, not for other cores
+                                cluster->response.whichBlock = thisBlock;
+                                cluster->cache1.externalStates[thisBlock] = Shared; //downgrade state to shared
+                                cluster->response.payload[0] = cluster->cache1.externalBlocks[thisBlock][0];
+                                cluster->response.payload[1] = cluster->cache1.externalBlocks[thisBlock][1];
+                                break;
+                            default:
+                                break;
+
+                        }
+                    }
+                    else {//if bus message from own core, ignore. Otherwise search for the block and reply
+                        if(cluster->previousBusMsg.sender == id)
+                            break;//ignore
+                        switch (cluster->cache1.externalStates[thisBlock])
+                        {
+                        case Invalid:
+                            break;
+                        case Shared:
+                            cluster->isIssuingResponse = 1;
+                            cluster->response.External = 1;
+                            cluster->response.fromHA = 0;
+                            cluster->response.sender = 1; //cluster 1
+                            cluster->response.receiver = 2; //cluster 2 requested this
+                            cluster->response.toMem = 0;
+                            cluster->response.whichBlock = thisBlock;
+                            cluster->response.payload[0] = cluster->cache1.externalBlocks[thisBlock][0];
+                            cluster->response.payload[1] = cluster->cache1.externalBlocks[thisBlock][1];
+
+                            break;
+                        case Modified:
+                            cluster->isIssuingResponse = 1;
+                            cluster->response.External = 1;
+                            cluster->response.fromHA = 0;
+                            cluster->response.sender = 1; //cluster 1
+                            cluster->response.receiver = 2; //cluster 2 wanted this
+                            cluster->response.toMem = 0;
+                            cluster->response.whichBlock = thisBlock;
+                            cluster->cache1.externalStates[thisBlock] = Shared; //downgrade state to shared
+                            cluster->response.payload[0] = cluster->cache1.externalBlocks[thisBlock][0];
+                            cluster->response.payload[1] = cluster->cache1.externalBlocks[thisBlock][1];
+                            break;
+                        default:
+                            break;
+                        }
+
+                    }
+                    break;//ignore
+                case GetM:
+                    if(cluster->previousBusMsg.fromHA) {//if bus message from HA, reply with data
+                        switch(cluster->cache1.externalStates[thisBlock]) {
+                            case Invalid:
+                                break; //ignore, i don't have a copy
+                            case Shared:
+                                //invalidate myself, don't have to send data as I am not responsible
+                                //for sending the most up-to-date copy of the data, the Host is responsible
+                                cluster->cache1.externalStates[thisBlock] = Invalid;
+                                // cluster->isIssuingResponse = 1;
+                                // cluster->response.External = 1;
+                                // cluster->response.fromHA = 0;
+                                // cluster->response.sender = 1; //cluster 1
+                                // cluster->response.toMem = 0;
+                                // cluster->response.receiver = 0; //indicating to Host, not to other cores
+                                // cluster->response.whichBlock = thisBlock;
+                                // cluster->response.payload[0] = cluster->cache1.externalBlocks[thisBlock][0];
+                                // cluster->response.payload[1] = cluster->cache1.externalBlocks[thisBlock][1];
+
+                                break;
+                            case Modified:
+                                //I need to send dirty data to host, to be relayed to the
+                                //requestor device
+                                cluster->cache1.externalStates[thisBlock] = Invalid;
+                                cluster->isIssuingResponse = 1;
+                                cluster->response.External = 1;
+                                cluster->response.fromHA = 0;
+                                cluster->response.sender = 1; //cluster 1
+                                cluster->response.toMem = 0;
+                                cluster->response.receiver = 0; //indicating to host, not for other cores
+                                cluster->response.whichBlock = thisBlock;
+                                cluster->response.payload[0] = cluster->cache1.externalBlocks[thisBlock][0];
+                                cluster->response.payload[1] = cluster->cache1.externalBlocks[thisBlock][1];
+                                break;
+                            default:
+                                break;
+
+                        }
+                    }
+                    else {//if bus message from own core, ignore. Otherwise search for the block and reply
+                        if(cluster->previousBusMsg.sender == id)
+                            break;//ignore
+                        switch (cluster->cache1.externalStates[thisBlock])
+                        {
+                        case Invalid://ignore
+                            break;
+                        case Shared:
+                            cluster->cache1.externalStates[thisBlock] = Invalid;//invalidate block
+                            //also send data to requestor core
+
+                            cluster->isIssuingResponse = 1;
+                            cluster->response.type = Data;
+                            cluster->response.External = 1;
+                            cluster->response.fromHA = 0;
+                            cluster->response.sender = 1; //cluster 1 sends it, meaning it was cluster 2 who requested it.
+                            cluster->response.receiver = 2; //cluster 2 requested this
+                            cluster->response.toMem = 0;
+                            cluster->response.whichBlock = thisBlock;
+                            cluster->response.payload[0] = cluster->cache1.externalBlocks[thisBlock][0];
+                            cluster->response.payload[1] = cluster->cache1.externalBlocks[thisBlock][1];
+
+                            break;
+                        case Modified:
+                            cluster->isIssuingResponse = 1;
+                            cluster->response.type = Data;
+                            cluster->response.External = 1;
+                            cluster->response.fromHA = 0;
+                            cluster->response.sender = 1; //cluster 1
+                            cluster->response.receiver = 2; //cluster 2 wanted this
+                            cluster->response.toMem = 0;
+                            cluster->response.whichBlock = thisBlock;
+                            cluster->cache1.externalStates[thisBlock] = Invalid; //invalidate state
+                            cluster->response.payload[0] = cluster->cache1.externalBlocks[thisBlock][0];
+                            cluster->response.payload[1] = cluster->cache1.externalBlocks[thisBlock][1];
+                            break;
+                        default:
+                            break;
+                        }
+
+                    }
+                    break;
+
+
+
+
+
+
+                    break;//ignore: transaction about HA memory
+                case PutM:
+                    break;//ignore: transaction to HA
+                case Data:
+                    printf("smoke data\n");
+                    trackerId = 8964;
+                    for(int i = 0; i <= trackersCount1 - 1; i++ ) {
+                        if(cluster1Trackers[i].blockNum == cluster->snooping_bus.whichBlock) {
+                            trackerId = i;
+                            break;
+                        }
+                    }
+                    printf("trackerId is %d, dataArrivesBeforeGO is %d\n", trackerId, cluster1Trackers[trackerId].DataArrivedBeforeGO);
+                    //TODO: revise the blockId part of cxl_units.h for dcoh_acts,trackerId instead of blockId
+
+
+                    if(cluster->previousBusMsg.receiver != id)
+                        break;
+                    printf("received data logic shoule be activated after got Data for write, payload[0] is %d, payload[1] is %d\n", cluster->previousBusMsg.payload[0], cluster->previousBusMsg.payload[1]);
+                    // PRINT("smoke after break %d \n", thisBlock);
+                    //TODO!!!: we assume the modified byte is always the first byte, need to be variable
+                    cluster->cache1.externalBlocks[thisBlock][1] = cluster->previousBusMsg.payload[1]; 
+                    if(cluster1Trackers[trackerId].DataArrivedBeforeGO == 0){//GO not arrived, needs to continue stalling
+                        cluster1Trackers[trackerId].DataArrivedBeforeGO = 1; // signals to the later GO processing clause that data arrived earlier than GO, and must not overwrite
+                        //copy data in, but cannot start write yet. TO CONFIRM: Read can happen already?
+                        cluster->cache1.externalBlocks[thisBlock][0] = cluster->previousBusMsg.payload[0];
+                        // switch(cluster->cache1.externalStates[thisBlock]) {
+                        //     case ISD:
+                        //         //& complete previous instruction load                                
+                        //         cluster->core1.registers[pending.regNum] = cluster->cache1.externalBlocks[thisBlock][0];
+                        //         NONPROD_ASSERT(thisBlock == pending.loc, "Data block id should be the same as the read instruction's read location");
+                        //         break;
+                        //     case IMD:
+                        //         break;
+                        //     case SMD:
+                        //         break;
+                        //     default:
+                        //         NONPROD_ASSERT(0, "received data for me while in transient state");
+                        //         break;
+                        // }
+                    }
+                    else {
+                        NONPROD_ASSERT(cluster1Trackers[trackerId].DataArrivedBeforeGO == 2, "If GO arrived first, DataArrivedBeforeGO should have been set to 2");                        
+
+                        //GO arrived, complete transaction
+                        cluster->cache1.doneOneThing = 1;//TODO: whether should doneOneThing be maintained for a core_reacts function call
+                        cluster->transactionInProgress = 0;
+                        cluster->core1.Stalled = 0;
+                        cluster->core2.Stalled = 0;
+                        pending = cluster->core1.pendingInstruction;
+                        //TODO: make sure whether other places needs advancing PC or not
+                        cluster->program1.PC++;
+                        switch(cluster->cache1.externalStates[thisBlock]) {
+                            case ISD:
+                                cluster->cache1.externalBlocks[thisBlock][0] = cluster->previousBusMsg.payload[0];
+                                
+                                cluster->cache1.externalStates[thisBlock] = Shared;
+                                //& complete previous instruction load                                
+                                cluster->core1.registers[pending.regNum] = cluster->cache1.externalBlocks[thisBlock][0];
+                                NONPROD_ASSERT(thisBlock == pending.loc, "Data block id should be the same as the read instruction's read location");
+                                break;
+                            case IMD:
+                                // NONPROD_ASSERT(0, "SMOKE IMD TO M id 1");
+                                // NONPROD_ASSERT(thisBlock == pending.loc, "IMD: data block should be same as write loc");
+                                // NONPROD_ASSERT(pending.type == Write, "should be write for IMD to M");
+                                cluster->cache1.externalStates[thisBlock] = Modified;
+                                //& complete previous instruction store
+                                cluster->cache1.externalBlocks[thisBlock][0] = pending.val;
+                                // PRINT2("block %d has value %d now\n", thisBlock, pending.val);
+                                break;
+                            case SMD:
+                                // NONPROD_ASSERT(0, "SMOKE SMD TO M id 1");
+                                // NONPROD_ASSERT(thisBlock == pending.loc, "SMD: data block should be same as write loc");
+                                cluster->cache1.externalStates[thisBlock] = Modified;
+                                //& complete previous instruction store
+                                cluster->cache1.externalBlocks[thisBlock][0] = pending.val;
+                                break;
+                            default:
+                                NONPROD_ASSERT(0, "received data for me while in transient state");
+                                break;
+                        }
+                    }
+
+
+        
+                    break;
+                case GO_CXL:
+                    //TODO:  complete transaction: do write/read for this location
+                    //copy data into cache
+                    NONPROD_ASSERT(0, "smoke GO_CXL core 1");
+                    trackerId = 8964;
+                    //TODO: We assume a tracker already exists, but have we made sure
+                    //all dcoh_acts clauses allocate a tracker whenever an External 
+                    //coherence transaction is initiated?
+                    for(int i = 0; i <= trackersCount1 - 1; i++ ) {
+                        if(cluster1Trackers[i].blockNum == cluster->snooping_bus.whichBlock) {
+                            trackerId = i;
+                            break;
+                        }
+                    }
+                    printf("%d, %d, trackerId at GO_CXL clause: %d\n", cluster->previousBusMsg.receiver, id, trackerId);
+                    if(cluster->previousBusMsg.receiver != id){
+                        break;
+                    }
+                    // PRINT("smoke after break %d \n", thisBlock);
+                    if(cluster1Trackers[trackerId].DataArrivedBeforeGO == 1) {
+                        //data arrived first, now able to complete transaction
+                        cluster->cache1.doneOneThing = 1;
+                        cluster->transactionInProgress = 0;
+                        cluster->core1.Stalled = 0;
+                        cluster->core2.Stalled = 0;
+                        pending = cluster->core1.pendingInstruction;
+                        
+                        cluster->program1.PC++;
+                        switch(cluster->cache1.externalStates[thisBlock]) {
+                            case ISD:
+                                
+                                cluster->cache1.externalStates[thisBlock] = Shared;
+                                //& complete previous instruction load
+                                cluster->core1.registers[pending.regNum] = cluster->cache1.externalBlocks[thisBlock][0];
+                                NONPROD_ASSERT(thisBlock == pending.loc, "Data block id should be the same as the read instruction's read location");
+                                break;
+                            case IMD:
+                                // NONPROD_ASSERT(0, "SMOKE IMD TO M id 1");
+                                // NONPROD_ASSERT(thisBlock == pending.loc, "IMD: data block should be same as write loc");
+                                // NONPROD_ASSERT(pending.type == Write, "should be write for IMD to M");
+                                cluster->cache1.externalStates[thisBlock] = Modified;
+                                //& complete previous instruction store
+                                cluster->cache1.externalBlocks[thisBlock][0] = pending.val;
+                                // PRINT2("block %d has value %d now\n", thisBlock, pending.val);
+                                break;
+                            case SMD:
+                                // NONPROD_ASSERT(0, "SMOKE SMD TO M id 1");
+                                // NONPROD_ASSERT(thisBlock == pending.loc, "SMD: data block should be same as write loc");
+                                cluster->cache1.externalStates[thisBlock] = Modified;
+                                //& complete previous instruction store
+                                cluster->cache1.externalBlocks[thisBlock][0] = pending.val;
+                                break;
+                            default:
+                                NONPROD_ASSERT(0, "received data for me while in transient state");
+                                break;
+                        }
+                        printf("core 1 got a GO_CXL message\n");
+                        //TODO!!!: deallocate tracker
+                    }
+                    else {//dataArrivesBeforeGo == 0
+                        // cluster->cache1.externalBlocks[thisBlock][0] = cluster->previousBusMsg.payload[0];
+                        // cluster->cache1.externalBlocks[thisBlock][1] = cluster->previousBusMsg.payload[1];
+                        cluster1Trackers[trackerId].DataArrivedBeforeGO = 2;//GO arrived first, data later, can't deallocate tracker
+                        switch(cluster->cache1.externalStates[thisBlock]) {
+                            case ISD:
+                                //can't yet get out of transient state, can't read either because data is not yet available
+                                NONPROD_ASSERT(thisBlock == pending.loc, "Data block id should be the same as the read instruction's read location");
+                                break;
+                            case IMD:
+                                //can already write value, but not setting state to Modified
+                                cluster->cache1.externalBlocks[thisBlock][0] = pending.val;
+                                // PRINT2("block %d has value %d now\n", thisBlock, pending.val);
+                                break;
+                            case SMD:
+                                // NONPROD_ASSERT(0, "SMOKE SMD TO M id 1");
+                                // NONPROD_ASSERT(thisBlock == pending.loc, "SMD: data block should be same as write loc");
+                                //cluster->cache1.externalStates[thisBlock] = Modified;
+                                //can write value, but not setting state to Modified
+                                cluster->cache1.externalBlocks[thisBlock][0] = pending.val;
+                                break;
+                            default:
+                                NONPROD_ASSERT(0, "received data for me while in transient state");
+                                break;
+                        }
+
+
+                    }
+
+                    break;
+                default:
+                    NONPROD_ASSERT(0, "unrecognised bus message");
+                    break;
+                }            
+                return;
+            }
+            switch (cluster->previousBusMsg.type)//this part deals with internal messages
             {
             case GetS:
                 if(cluster->previousBusMsg.sender == id)
@@ -442,10 +832,356 @@ void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
         //cluster->hasPreviousBusMsg = 0;
         return;
     }
+
+
     if(id == 2) {
-        thisBlock = cluster->previousBusMsg.whichBlock;
         if(cluster->hasPreviousBusMsg){
-            switch (cluster->previousBusMsg.type)
+            if(cluster->previousBusMsg.External == 1) {
+                //this message is about a communication to the HA
+                printf("got previous external bus message\n");
+                switch(cluster->previousBusMsg.type)
+                {
+                case GetS:
+                    if(cluster->previousBusMsg.fromHA) {//if bus message from HA, reply with data
+                        switch(cluster->cache2.externalStates[thisBlock]) {
+                            case Invalid:
+                                break; //ignore, i don't have a copy
+                            case Shared:
+                                cluster->isIssuingResponse = 1;
+                                cluster->response.External = 1;
+                                cluster->response.fromHA = 0;
+                                cluster->response.sender = 2; //cluster 2
+                                cluster->response.toMem = 0;
+                                cluster->response.receiver = 0; //indicating to Host, not to other cores
+                                cluster->response.whichBlock = thisBlock;
+                                cluster->response.payload[0] = cluster->cache2.externalBlocks[thisBlock][0];
+                                cluster->response.payload[1] = cluster->cache2.externalBlocks[thisBlock][1];
+
+                                break;
+                            case Modified:
+
+                                cluster->isIssuingResponse = 1;
+                                cluster->response.External = 1;
+                                cluster->response.fromHA = 0;
+                                cluster->response.sender = 2; //cluster 2
+                                cluster->response.toMem = 0;
+                                cluster->response.receiver = 0; //indicating this message is for host, not for other cores
+                                cluster->response.whichBlock = thisBlock;
+                                cluster->cache2.externalStates[thisBlock] = Shared; //downgrade state to shared
+                                cluster->response.payload[0] = cluster->cache2.externalBlocks[thisBlock][0];
+                                cluster->response.payload[1] = cluster->cache2.externalBlocks[thisBlock][1];
+                                break;
+                            default:
+                                break;
+
+                        }
+                    }
+                    else {//if bus message from own core, ignore. Otherwise search for the block and reply
+                        if(cluster->previousBusMsg.sender == id)
+                            break;//ignore
+                        switch (cluster->cache2.externalStates[thisBlock])
+                        {
+                        case Invalid:
+                            break;
+                        case Shared:
+                            cluster->isIssuingResponse = 1;
+                            cluster->response.External = 1;
+                            cluster->response.fromHA = 0;
+                            cluster->response.sender = 2; //cluster 2
+                            cluster->response.receiver = 1; //cluster 1 requested this
+                            cluster->response.toMem = 0;
+                            cluster->response.whichBlock = thisBlock;
+                            cluster->response.payload[0] = cluster->cache2.externalBlocks[thisBlock][0];
+                            cluster->response.payload[1] = cluster->cache2.externalBlocks[thisBlock][1];
+
+                            break;
+                        case Modified:
+                            cluster->isIssuingResponse = 1;
+                            cluster->response.External = 1;
+                            cluster->response.fromHA = 0;
+                            cluster->response.sender = 2; //cluster 2
+                            cluster->response.receiver = 1; //cluster 1 wanted this
+                            cluster->response.toMem = 0;
+                            cluster->response.whichBlock = thisBlock;
+                            cluster->cache2.externalStates[thisBlock] = Shared; //downgrade state to shared
+                            cluster->response.payload[0] = cluster->cache2.externalBlocks[thisBlock][0];
+                            cluster->response.payload[1] = cluster->cache2.externalBlocks[thisBlock][1];
+                            break;
+                        default:
+                            break;
+                        }
+
+                    }
+                    break;//ignore
+                case GetM:
+                    if(cluster->previousBusMsg.fromHA) {//if bus message from HA, reply with data
+                        switch(cluster->cache2.externalStates[thisBlock]) {
+                            case Invalid:
+                                break; //ignore, i don't have a copy
+                            case Shared:
+                                //invalidate myself, don't have to send data as I am not responsible
+                                //for sending the most up-to-date copy of the data, the Host is responsible
+                                cluster->cache2.externalStates[thisBlock] = Invalid;
+                                // cluster->isIssuingResponse = 1;
+                                // cluster->response.External = 1;
+                                // cluster->response.fromHA = 0;
+                                // cluster->response.sender = 1; //cluster 1
+                                // cluster->response.toMem = 0;
+                                // cluster->response.receiver = 0; //indicating to Host, not to other cores
+                                // cluster->response.whichBlock = thisBlock;
+                                // cluster->response.payload[0] = cluster->cache2.externalBlocks[thisBlock][0];
+                                // cluster->response.payload[1] = cluster->cache2.externalBlocks[thisBlock][1];
+
+                                break;
+                            case Modified:
+                                //I need to send dirty data to host, to be relayed to the
+                                //requestor device
+                                cluster->cache2.externalStates[thisBlock] = Invalid;
+                                cluster->isIssuingResponse = 1;
+                                cluster->response.External = 1;
+                                cluster->response.fromHA = 0;
+                                cluster->response.sender = 2; //cluster 2
+                                cluster->response.toMem = 0;
+                                cluster->response.receiver = 0; //indicating to host, not for other cores
+                                cluster->response.whichBlock = thisBlock;
+                                cluster->response.payload[0] = cluster->cache2.externalBlocks[thisBlock][0];
+                                cluster->response.payload[1] = cluster->cache2.externalBlocks[thisBlock][1];
+                                break;
+                            default:
+                                break;
+
+                        }
+                    }
+                    else {//if bus message from one of own cluster's core, ignore. Otherwise search for the block and reply
+                        if(cluster->previousBusMsg.sender == id)
+                            break;//ignore
+                        switch (cluster->cache2.externalStates[thisBlock])
+                        {
+                        case Invalid://ignore
+                            break;
+                        case Shared://TODO: when 1 core is in shared state, the other core asks GetM
+                            cluster->cache2.externalStates[thisBlock] = Invalid;//invalidate block
+                            //also send data to requestor core
+
+                            cluster->isIssuingResponse = 1;
+                            cluster->response.type = Data;
+                            cluster->response.External = 1;
+                            cluster->response.fromHA = 0;
+                            cluster->response.sender = 2; //cluster 2 sends it, meaning it was cluster 1 who requested it.
+                            cluster->response.receiver = 1; //cluster 2 requested this
+                            cluster->response.toMem = 0;
+                            cluster->response.whichBlock = thisBlock;
+                            cluster->response.payload[0] = cluster->cache2.externalBlocks[thisBlock][0];
+                            cluster->response.payload[1] = cluster->cache2.externalBlocks[thisBlock][1];
+
+                            break;
+                        case Modified:
+                            cluster->isIssuingResponse = 1;
+                            cluster->response.type = Data;
+                            cluster->response.External = 1;
+                            cluster->response.fromHA = 0;
+                            cluster->response.sender = 2; //cluster 2
+                            cluster->response.receiver = 1; //cluster 2 wanted this
+                            cluster->response.toMem = 0;
+                            cluster->response.whichBlock = thisBlock;
+                            cluster->cache2.externalStates[thisBlock] = Invalid; //invalidate state
+                            cluster->response.payload[0] = cluster->cache2.externalBlocks[thisBlock][0];
+                            cluster->response.payload[1] = cluster->cache2.externalBlocks[thisBlock][1];
+                            break;
+                        default:
+                            break;
+                        }
+
+                    }
+                    break;
+
+
+
+
+
+
+                    break;//ignore: transaction about HA memory
+                case PutM:
+                    break;//ignore: transaction to HA
+                case Data:
+                    printf("smoke data\n");
+                    trackerId = 8964;
+                    for(int i = 0; i <= trackersCount1 - 1; i++ ) {
+                        if(cluster1Trackers[i].blockNum == cluster->snooping_bus.whichBlock) {
+                            trackerId = i;
+                            break;
+                        }
+                    }
+                    printf("trackerId is %d, dataArrivesBeforeGO is %d\n", trackerId, cluster1Trackers[trackerId].DataArrivedBeforeGO);
+                    //TODO: revise the blockId part of cxl_units.h for dcoh_acts,trackerId instead of blockId
+
+
+                    if(cluster->previousBusMsg.receiver != id)
+                        break;
+                    printf("received data logic shoule be activated after got Data for write, payload[0] is %d, payload[1] is %d\n", cluster->previousBusMsg.payload[0], cluster->previousBusMsg.payload[1]);
+                    // PRINT("smoke after break %d \n", thisBlock);
+                    //TODO!!!: we assume the modified byte is always the first byte, need to be variable
+                    cluster->cache2.externalBlocks[thisBlock][1] = cluster->previousBusMsg.payload[1]; 
+                    if(cluster1Trackers[trackerId].DataArrivedBeforeGO == 0){//GO not arrived, needs to continue stalling
+                        cluster1Trackers[trackerId].DataArrivedBeforeGO = 1; // signals to the later GO processing clause that data arrived earlier than GO, and must not overwrite
+                        //copy data in, but cannot start write yet. TO CONFIRM: Read can happen already?
+                        cluster->cache2.externalBlocks[thisBlock][0] = cluster->previousBusMsg.payload[0];
+                        // switch(cluster->cache2.externalStates[thisBlock]) {
+                        //     case ISD:
+                        //         //& complete previous instruction load                                
+                        //         cluster->core1.registers[pending.regNum] = cluster->cache2.externalBlocks[thisBlock][0];
+                        //         NONPROD_ASSERT(thisBlock == pending.loc, "Data block id should be the same as the read instruction's read location");
+                        //         break;
+                        //     case IMD:
+                        //         break;
+                        //     case SMD:
+                        //         break;
+                        //     default:
+                        //         NONPROD_ASSERT(0, "received data for me while in transient state");
+                        //         break;
+                        // }
+                    }
+                    else {
+                        NONPROD_ASSERT(cluster1Trackers[trackerId].DataArrivedBeforeGO == 2, "If GO arrived first, DataArrivedBeforeGO should have been set to 2");                        
+
+                        //GO arrived, complete transaction
+                        cluster->cache2.doneOneThing = 1;//TODO: whether should doneOneThing be maintained for a core_reacts function call
+                        cluster->transactionInProgress = 0;
+                        cluster->core1.Stalled = 0;
+                        cluster->core2.Stalled = 0;
+                        pending = cluster->core1.pendingInstruction;
+                        //TODO: make sure whether other places needs advancing PC or not
+                        cluster->program1.PC++;
+                        switch(cluster->cache2.externalStates[thisBlock]) {
+                            case ISD:
+                                cluster->cache2.externalBlocks[thisBlock][0] = cluster->previousBusMsg.payload[0];
+                                
+                                cluster->cache2.externalStates[thisBlock] = Shared;
+                                //& complete previous instruction load                                
+                                cluster->core1.registers[pending.regNum] = cluster->cache2.externalBlocks[thisBlock][0];
+                                NONPROD_ASSERT(thisBlock == pending.loc, "Data block id should be the same as the read instruction's read location");
+                                break;
+                            case IMD:
+                                // NONPROD_ASSERT(0, "SMOKE IMD TO M id 1");
+                                // NONPROD_ASSERT(thisBlock == pending.loc, "IMD: data block should be same as write loc");
+                                // NONPROD_ASSERT(pending.type == Write, "should be write for IMD to M");
+                                cluster->cache2.externalStates[thisBlock] = Modified;
+                                //& complete previous instruction store
+                                cluster->cache2.externalBlocks[thisBlock][0] = pending.val;
+                                // PRINT2("block %d has value %d now\n", thisBlock, pending.val);
+                                break;
+                            case SMD:
+                                // NONPROD_ASSERT(0, "SMOKE SMD TO M id 1");
+                                // NONPROD_ASSERT(thisBlock == pending.loc, "SMD: data block should be same as write loc");
+                                cluster->cache2.externalStates[thisBlock] = Modified;
+                                //& complete previous instruction store
+                                cluster->cache2.externalBlocks[thisBlock][0] = pending.val;
+                                break;
+                            default:
+                                NONPROD_ASSERT(0, "received data for me while in transient state");
+                                break;
+                        }
+                    }
+
+
+        
+                    break;
+                case GO_CXL:
+                    //TODO:  complete transaction: do write/read for this location
+                    //copy data into cache
+                    NONPROD_ASSERT(0, "smoke GO_CXL core 1");
+                    trackerId = 8964;
+                    //TODO: We assume a tracker already exists, but have we made sure
+                    //all dcoh_acts clauses allocate a tracker whenever an External 
+                    //coherence transaction is initiated?
+                    for(int i = 0; i <= trackersCount1 - 1; i++ ) {
+                        if(cluster1Trackers[i].blockNum == cluster->snooping_bus.whichBlock) {
+                            trackerId = i;
+                            break;
+                        }
+                    }
+                    printf("%d, %d, trackerId at GO_CXL clause: %d\n", cluster->previousBusMsg.receiver, id, trackerId);
+                    if(cluster->previousBusMsg.receiver != id){
+                        break;
+                    }
+                    // PRINT("smoke after break %d \n", thisBlock);
+                    if(cluster1Trackers[trackerId].DataArrivedBeforeGO == 1) {
+                        //data arrived first, now able to complete transaction
+                        cluster->cache2.doneOneThing = 1;
+                        cluster->transactionInProgress = 0;
+                        cluster->core1.Stalled = 0;
+                        cluster->core2.Stalled = 0;
+                        pending = cluster->core1.pendingInstruction;
+                        
+                        cluster->program1.PC++;
+                        switch(cluster->cache2.externalStates[thisBlock]) {
+                            case ISD:
+                                
+                                cluster->cache2.externalStates[thisBlock] = Shared;
+                                //& complete previous instruction load
+                                cluster->core1.registers[pending.regNum] = cluster->cache2.externalBlocks[thisBlock][0];
+                                NONPROD_ASSERT(thisBlock == pending.loc, "Data block id should be the same as the read instruction's read location");
+                                break;
+                            case IMD:
+                                // NONPROD_ASSERT(0, "SMOKE IMD TO M id 1");
+                                // NONPROD_ASSERT(thisBlock == pending.loc, "IMD: data block should be same as write loc");
+                                // NONPROD_ASSERT(pending.type == Write, "should be write for IMD to M");
+                                cluster->cache2.externalStates[thisBlock] = Modified;
+                                //& complete previous instruction store
+                                cluster->cache2.externalBlocks[thisBlock][0] = pending.val;
+                                // PRINT2("block %d has value %d now\n", thisBlock, pending.val);
+                                break;
+                            case SMD:
+                                // NONPROD_ASSERT(0, "SMOKE SMD TO M id 1");
+                                // NONPROD_ASSERT(thisBlock == pending.loc, "SMD: data block should be same as write loc");
+                                cluster->cache2.externalStates[thisBlock] = Modified;
+                                //& complete previous instruction store
+                                cluster->cache2.externalBlocks[thisBlock][0] = pending.val;
+                                break;
+                            default:
+                                NONPROD_ASSERT(0, "received data for me while in transient state");
+                                break;
+                        }
+                        printf("core 1 got a GO_CXL message\n");
+                        //TODO!!!: deallocate tracker
+                    }
+                    else {//dataArrivesBeforeGo == 0
+                        // cluster->cache2.externalBlocks[thisBlock][0] = cluster->previousBusMsg.payload[0];
+                        // cluster->cache2.externalBlocks[thisBlock][1] = cluster->previousBusMsg.payload[1];
+                        cluster1Trackers[trackerId].DataArrivedBeforeGO = 2;//GO arrived first, data later, can't deallocate tracker
+                        switch(cluster->cache2.externalStates[thisBlock]) {
+                            case ISD:
+                                //can't yet get out of transient state, can't read either because data is not yet available
+                                NONPROD_ASSERT(thisBlock == pending.loc, "Data block id should be the same as the read instruction's read location");
+                                break;
+                            case IMD:
+                                //can already write value, but not setting state to Modified
+                                cluster->cache2.externalBlocks[thisBlock][0] = pending.val;
+                                // PRINT2("block %d has value %d now\n", thisBlock, pending.val);
+                                break;
+                            case SMD:
+                                // NONPROD_ASSERT(0, "SMOKE SMD TO M id 1");
+                                // NONPROD_ASSERT(thisBlock == pending.loc, "SMD: data block should be same as write loc");
+                                //cluster->cache2.externalStates[thisBlock] = Modified;
+                                //can write value, but not setting state to Modified
+                                cluster->cache2.externalBlocks[thisBlock][0] = pending.val;
+                                break;
+                            default:
+                                NONPROD_ASSERT(0, "received data for me while in transient state");
+                                break;
+                        }
+
+
+                    }
+
+                    break;
+                default:
+                    NONPROD_ASSERT(0, "unrecognised bus message");
+                    break;
+                }            
+                return;
+            }
+            switch (cluster->previousBusMsg.type)//this part deals with internal messages
             {
             case GetS:
                 if(cluster->previousBusMsg.sender == id)
@@ -464,40 +1200,45 @@ void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
                 break;
             case Data:
                 //copy data into cache
-
-                // NONPROD_ASSERT(0, "smoke DATA core 2");
-
+                // NONPROD_ASSERT(0, "smoke DATA Response 1");
+                //PRINT("%d", )
                 if(cluster->previousBusMsg.receiver != id)
                     break;
-                // NONPROD_ASSERT(0, "smoke DATA core 2 *");
+                // PRINT("smoke after break %d \n", thisBlock);
                 cluster->cache2.dataBlocks[thisBlock][0] = cluster->previousBusMsg.payload[0];
                 cluster->cache2.dataBlocks[thisBlock][1] = cluster->previousBusMsg.payload[1];
                 cluster->cache2.doneOneThing = 1;
                 cluster->transactionInProgress = 0;
-                cluster->core1.Stalled = 0; //unstall both cores
+                cluster->core1.Stalled = 0;
                 cluster->core2.Stalled = 0;
-                pending = cluster->core2.pendingInstruction;
+                pending = cluster->core1.pendingInstruction;
+                
                 switch(cluster->cache2.blockStates[thisBlock]) {
                     case ISD:
+                        
                         cluster->cache2.blockStates[thisBlock] = Shared;
-                        cluster->core2.registers[pending.regNum] = cluster->cache2.dataBlocks[thisBlock][0];
+                        //& complete previous instruction load
+                        cluster->core1.registers[pending.regNum] = cluster->cache2.dataBlocks[thisBlock][0];
                         NONPROD_ASSERT(thisBlock == pending.loc, "Data block id should be the same as the read instruction's read location");
                         break;
                     case IMD:
-                        // NONPROD_ASSERT(0, "SMOKE IMD TO M id 2");
-                        // PRINT2("block %d of cache 2 is set to %d \n", thisBlock, pending.val);
+                        // NONPROD_ASSERT(0, "SMOKE IMD TO M id 1");
+                        // NONPROD_ASSERT(thisBlock == pending.loc, "IMD: data block should be same as write loc");
+                        // NONPROD_ASSERT(pending.type == Write, "should be write for IMD to M");
                         cluster->cache2.blockStates[thisBlock] = Modified;
                         //& complete previous instruction store
                         cluster->cache2.dataBlocks[thisBlock][0] = pending.val;
+                        // PRINT2("block %d has value %d now\n", thisBlock, pending.val);
                         break;
                     case SMD:
-                        // NONPROD_ASSERT(0, "SMOKE SMD TO M id 2");
+                        // NONPROD_ASSERT(0, "SMOKE SMD TO M id 1");
+                        // NONPROD_ASSERT(thisBlock == pending.loc, "SMD: data block should be same as write loc");
                         cluster->cache2.blockStates[thisBlock] = Modified;
                         //& complete previous instruction store
                         cluster->cache2.dataBlocks[thisBlock][0] = pending.val;
                         break;
                     default:
-                        NONPROD_ASSERT(0, "core 2 received data for me while in transient state");
+                        NONPROD_ASSERT(0, "received data for me while in transient state");
                         break;
                 }
                 break;                        
@@ -506,20 +1247,25 @@ void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
                 break;
             }
         }
-        // cluster->hasPreviousBusMsg = 0;
+        //cluster->hasPreviousBusMsg = 0;
         return;
     }
+
+
+
+
+
 }
 void update_PC(int id, Cluster * cluster) {
     if(id == 1) {
         if (!cluster->core1.Stalled && cluster->program1.PC <= cluster->program1.NumInstructions ){
-            // NONPROD_ASSERT(0, "smoke PC UPDATE");
+            NONPROD_ASSERT(0, "smoke PC UPDATE");
             cluster->program1.PC++;
         }
     }
     if(id == 2) {
         if (!cluster->core2.Stalled && cluster->program2.PC <= cluster->program2.NumInstructions) {
-            // NONPROD_ASSERT(0, "smoke pc update");
+            NONPROD_ASSERT(0, "smoke pc update");
             cluster->program2.PC++;
         }
     }
@@ -560,106 +1306,270 @@ void execute_instruction(int id, Cluster * cluster) {
     Instruction instr;
     if(id == 1) {
         if(cluster->core1.Stalled || cluster->program1.PC >= cluster->program1.NumInstructions ) {
+            printf("executing core %d's instruction %d, but got stalled at this cycle,,,%d, %d %d\n", id, cluster->program1.PC, cluster->core1.Stalled, cluster->program1.PC, cluster->program1.NumInstructions);
+
             ;//keep stalling, stalled by other cores' coherence transactions
         }
         else {//take instruction to execute
+            printf("ffff:%d, %d\n", id, cluster->program1.PC);
+
             instr = cluster->program1.instructions[cluster->program1.PC];
-            switch(instr.type) {
-                case Read:
-                    switch (cluster->cache1.blockStates[instr.loc])
-                    {
-                    case Invalid:
+            if(!instr.external) {
+                switch(instr.type) {
+                    case Read:
+                        printf("instruction is read\n");
+                        switch (cluster->cache1.blockStates[instr.loc])
+                        {
+                        case Invalid:
+                            
+                            cluster->core1.pendingInstruction = instr;
+                            if(cluster->transactionInProgress) {//disallow PC to move to next instruction
+                                cluster->core1.Stalled = 1;       
+                            }
+                            else {
+                                cluster->request.type = GetS;
+                                cluster->request.sender = id;
+                                cluster->request.whichBlock = instr.loc;
+                                cluster->request.External = instr.external;
+                                cluster->request.fromHA = 0;
+                                cluster->isIssuingRequest = id;
+                                cluster->transactionInProgress = id;
+                                cluster->core1.Stalled = 1;
+                                cluster->cache1.blockStates[instr.loc] = ISD;
+                                
+                                
+                            }
+                            break;
+                        case Shared:
+                            cluster->core1.registers[instr.regNum] = cluster->cache1.dataBlocks[instr.loc][0];
+                            break;
+                        case Modified:
+                            cluster->core1.registers[instr.regNum] = cluster->cache1.dataBlocks[instr.loc][0];
+                            break;
+                        default://TODO: Allow SMD to hit
+                            NONPROD_ASSERT(0, "atomic transaction violated");
+                            break;
+                        }
+                        break;
+                    case Write:
+                        printf("instruction is write\n");
                         
-                        cluster->core1.pendingInstruction = instr;
-                        if(cluster->transactionInProgress) {//disallow PC to move to next instruction
-                            cluster->core1.Stalled = 1;       
+                        switch (cluster->cache1.blockStates[instr.loc])
+                        {
+                        case Invalid:
+                            printf("invalid case activated\n");
+                            cluster->core1.pendingInstruction = instr;
+                            if(cluster->transactionInProgress) {
+                                cluster->core1.Stalled = 1;
+                                
+                            }
+                            else {
+                                printf("started a transaction\n");
+                                cluster->cache1.blockStates[instr.loc] = IMD;
+                                cluster->request.type = GetM;
+                                cluster->request.sender = id;
+                                cluster->request.whichBlock = instr.loc;
+                                cluster->request.External = instr.external;
+                                cluster->request.fromHA = 0;
+                                cluster->isIssuingRequest = id;
+                                cluster->transactionInProgress = id;
+                                cluster->core1.Stalled = 1;
+                            }
+                            break;
+                        case Shared:
+                            cluster->core1.pendingInstruction = instr;
+                            if(cluster->transactionInProgress) {
+                                cluster->core1.Stalled = 1;
+                                
+                            }
+                            else {
+                                
+                                cluster->cache1.blockStates[instr.loc] = SMD;
+                                cluster->request.type = GetM;
+                                cluster->request.sender = id;
+                                cluster->request.whichBlock = instr.loc;
+                                cluster->request.External = instr.external;
+                                cluster->request.fromHA = 0;
+                                cluster->isIssuingRequest = id;
+                                cluster->transactionInProgress = id;
+                                cluster->core1.Stalled = 1;
+                            }
+                            break;
+                        case Modified:
+                            // NONPROD_ASSERT(0, "smoke test cluster->core1 modified no Trans in progress branch");
+                            
+                            cluster->cache1.dataBlocks[instr.loc][0] = instr.val;
+
+                            break;
+                        default:
+                            break;
                         }
-                        else {
-                            cluster->cache1.blockStates[instr.loc] = ISD;
-                            cluster->request.type = GetS;
-                            cluster->request.sender = id;
-                            cluster->request.whichBlock = instr.loc;
-                            cluster->isIssuingRequest = id;
-                            cluster->transactionInProgress = id;
-                            cluster->core1.Stalled = 1;
-                        }
                         break;
-                    case Shared:
-                        cluster->core1.registers[instr.regNum] = cluster->cache1.dataBlocks[instr.loc][0];
-                        break;
-                    case Modified:
-                        cluster->core1.registers[instr.regNum] = cluster->cache1.dataBlocks[instr.loc][0];
-                        break;
-                    default://TODO: Allow SMD to hit
-                        NONPROD_ASSERT(0, "atomic transaction violated");
-                        break;
-                    }
-                    break;
-                case Write:
-                    
-                    switch (cluster->cache1.blockStates[instr.loc])
-                    {
-                    case Invalid:
+                    case Evict:
                         cluster->core1.pendingInstruction = instr;
                         if(cluster->transactionInProgress) {
                             cluster->core1.Stalled = 1;
-                            
                         }
-                        else {
-                            cluster->cache1.blockStates[instr.loc] = IMD;
-                            cluster->request.type = GetM;
+                        else {//issue PutM cluster->request, set cluster->transactionInProgress
+                            cluster->request.type = PutM;
                             cluster->request.sender = id;
                             cluster->request.whichBlock = instr.loc;
+                            cluster->request.External = instr.external;
+                            cluster->request.fromHA = 0;
                             cluster->isIssuingRequest = id;
+                            cluster->core1.Stalled = 1;
                             cluster->transactionInProgress = id;
-                            cluster->core1.Stalled = 1;
-                        }
-                        break;
-                    case Shared:
-                        cluster->core1.pendingInstruction = instr;
-                        if(cluster->transactionInProgress) {
-                            cluster->core1.Stalled = 1;
                             
+                            cluster->cache1.blockStates[instr.loc] = Invalid;
                         }
-                        else {
-                            // NONPROD_ASSERT(0, "smoke test cluster->core1 shared no Trans in progress branch");
-                            
-                            cluster->cache1.blockStates[instr.loc] = SMD;
-                            cluster->request.type = GetM;
-                            cluster->request.sender = id;
-                            cluster->request.whichBlock = instr.loc;
-                            cluster->isIssuingRequest = id;
-                            cluster->transactionInProgress = id;
-                            cluster->core1.Stalled = 1;
-                        }
-                        break;
-                    case Modified:
-                        // NONPROD_ASSERT(0, "smoke test cluster->core1 modified no Trans in progress branch");
-                        cluster->cache1.dataBlocks[instr.loc][0] = instr.val;
                         break;
                     default:
+                        NONPROD_ASSERT(instr.type, "undef instruction type");
                         break;
-                    }
-                    break;
-                case Evict:
-                    cluster->core1.pendingInstruction = instr;
-                    if(cluster->transactionInProgress) {
-                        cluster->core1.Stalled = 1;
-                    }
-                    else {//issue PutM cluster->request, set cluster->transactionInProgress
-                        cluster->request.type = PutM;
-                        cluster->request.sender = id;
-                        cluster->request.whichBlock = instr.loc;
-                        cluster->isIssuingRequest = id;
-                        cluster->core1.Stalled = 1;
-                        cluster->transactionInProgress = id;
-                        cluster->cache1.blockStates[instr.loc] = Invalid;
-                    }
-                    break;
-                default:
-                    NONPROD_ASSERT(instr.type, "undef instruction type");
-                    break;
+                }
             }
+            
+            else{
+                switch(instr.type) {
+                    case Read:
+                        printf("instruction is read\n");
+                        switch (cluster->cache1.blockStates[instr.loc])
+                        {
+                        case Invalid:
+                            
+                            cluster->core1.pendingInstruction = instr;
+                            if(cluster->transactionInProgress) {//disallow PC to move to next instruction
+                                cluster->core1.Stalled = 1;       
+                            }
+                            else {
+                                cluster->request.type = GetS;
+                                cluster->request.sender = id;
+                                cluster->request.whichBlock = instr.loc;
+                                cluster->request.External = instr.external;
+                                cluster->request.fromHA = 0;
+                                cluster->isIssuingRequest = id;
+                                cluster->transactionInProgress = id;
+                                cluster->core1.Stalled = 1;
+                                if(instr.external) {
+                                    cluster->cache1.externalStates[instr.loc] = ISD;
+                                }
+                                else {
+                                    cluster->cache1.blockStates[instr.loc] = ISD;
+                                }
+                            }
+                            break;
+                        case Shared:
+                            if(instr.external)
+                                cluster->core1.registers[instr.regNum] = cluster->cache1.externalBlocks[instr.loc][0];
+                            else
+                                cluster->core1.registers[instr.regNum] = cluster->cache1.dataBlocks[instr.loc][0];
+                            break;
+                        case Modified:
+                            if(instr.external)
+                                cluster->core1.registers[instr.regNum] = cluster->cache1.externalBlocks[instr.loc][0];
+                            else
+                                cluster->core1.registers[instr.regNum] = cluster->cache1.dataBlocks[instr.loc][0];
+                            break;
+                        default://TODO: Allow SMD to hit
+                            NONPROD_ASSERT(0, "atomic transaction violated");
+                            break;
+                        }
+                        break;
+                    case Write:
+                        printf("instruction is write(external)\n");
+                        
+                        switch (cluster->cache1.blockStates[instr.loc])
+                        {
+                        case Invalid:
+                            cluster->core1.pendingInstruction = instr;
+                            if(cluster->transactionInProgress) {
+                                cluster->core1.Stalled = 1;
+                                
+                            }
+                            else {
+                                if(instr.external)
+                                {
+                                    printf("core 1 external write should trigger this\n");
+                                    cluster->cache1.externalStates[instr.loc] = IMD;
+
+                                }
+                                else 
+                                    cluster->cache1.blockStates[instr.loc] = IMD;
+                                cluster->request.type = GetM;
+                                cluster->request.sender = id;
+                                cluster->request.whichBlock = instr.loc;
+                                cluster->request.External = instr.external;
+                                cluster->request.fromHA = 0;
+                                cluster->isIssuingRequest = id;
+                                cluster->transactionInProgress = id;
+                                cluster->core1.Stalled = 1;
+                            }
+                            break;
+                        case Shared:
+                            cluster->core1.pendingInstruction = instr;
+                            if(cluster->transactionInProgress) {
+                                cluster->core1.Stalled = 1;
+                                
+                            }
+                            else {
+                                // NONPROD_ASSERT(0, "smoke test cluster->core1 shared no Trans in progress branch");
+                                if(instr.external) {
+                                    cluster->cache1.externalStates[instr.loc] = SMD;
+                                }
+                                else
+                                    cluster->cache1.blockStates[instr.loc] = SMD;
+                                cluster->request.type = GetM;
+                                cluster->request.sender = id;
+                                cluster->request.whichBlock = instr.loc;
+                                cluster->request.External = instr.external;
+                                cluster->request.fromHA = 0;
+                                cluster->isIssuingRequest = id;
+                                cluster->transactionInProgress = id;
+                                cluster->core1.Stalled = 1;
+                            }
+                            break;
+                        case Modified:
+                            NONPROD_ASSERT(0, "smoke test cluster->core1 modified no Trans in progress branch");
+                            if(instr.external)
+                                cluster->cache1.externalBlocks[instr.loc][0] = instr.val;
+                            else
+                                cluster->cache1.dataBlocks[instr.loc][0] = instr.val;
+
+                            break;
+                        default:
+                            break;
+                        }
+                        break;
+                    case Evict:
+                        cluster->core1.pendingInstruction = instr;
+                        if(cluster->transactionInProgress) {
+                            cluster->core1.Stalled = 1;
+                        }
+                        else {//issue PutM cluster->request, set cluster->transactionInProgress
+                            cluster->request.type = PutM;
+                            cluster->request.sender = id;
+                            cluster->request.whichBlock = instr.loc;
+                            cluster->request.External = instr.external;
+                            cluster->request.fromHA = 0;
+                            cluster->isIssuingRequest = id;
+                            cluster->core1.Stalled = 1;
+                            cluster->transactionInProgress = id;
+                            if(instr.external)
+                                cluster->cache1.externalStates[instr.loc] = Invalid;
+                            else
+                                cluster->cache1.blockStates[instr.loc] = Invalid;
+                        }
+                        break;
+                    default:
+                        NONPROD_ASSERT(instr.type, "undef instruction type");
+                        break;
+                }
+            }
+
+
+
+
+
         }
     }
 
@@ -669,97 +1579,259 @@ void execute_instruction(int id, Cluster * cluster) {
         }
         else {//take instruction to execute
             instr = cluster->program2.instructions[cluster->program2.PC];
-            switch(instr.type) {
-                case Read:
-                    switch (cluster->cache2.blockStates[instr.loc])
-                    {
-                    case Invalid:
-                        cluster->core2.pendingInstruction = instr;
-                        if(cluster->transactionInProgress) {//disallow PC to move to next instruction
-                            cluster->core2.Stalled = 1;
+            if(!instr.external) {
+                switch(instr.type) {
+                    case Read:
+                        printf("instruction is read\n");
+                        switch (cluster->cache2.blockStates[instr.loc])
+                        {
+                        case Invalid:
+                            
+                            cluster->core2.pendingInstruction = instr;
+                            if(cluster->transactionInProgress) {//disallow PC to move to next instruction
+                                cluster->core2.Stalled = 1;       
+                            }
+                            else {
+                                cluster->request.type = GetS;
+                                cluster->request.sender = id;
+                                cluster->request.whichBlock = instr.loc;
+                                cluster->request.External = instr.external;
+                                cluster->request.fromHA = 0;
+                                cluster->isIssuingRequest = id;
+                                cluster->transactionInProgress = id;
+                                cluster->core2.Stalled = 1;
+                                cluster->cache2.blockStates[instr.loc] = ISD;
+                                
+                                
+                            }
+                            break;
+                        case Shared:
+                            cluster->core2.registers[instr.regNum] = cluster->cache2.dataBlocks[instr.loc][0];
+                            break;
+                        case Modified:
+                            cluster->core2.registers[instr.regNum] = cluster->cache2.dataBlocks[instr.loc][0];
+                            break;
+                        default://TODO: Allow SMD to hit
+                            NONPROD_ASSERT(0, "atomic transaction violated");
+                            break;
                         }
-                        else {
-                            cluster->cache2.blockStates[instr.loc] = ISD;
-                            cluster->request.type = GetS;
-                            cluster->request.sender = id;
-                            cluster->request.whichBlock = instr.loc;
-                            cluster->isIssuingRequest = id;
-                            cluster->transactionInProgress = id;
-                            cluster->core2.Stalled = 1;
-                            // PRINT("cache 2 requesting %d read access \n", instr.loc);
+                        break;
+                    case Write:
+                        printf("instruction is write\n");
+                        
+                        switch (cluster->cache2.blockStates[instr.loc])
+                        {
+                        case Invalid:
+                            cluster->core2.pendingInstruction = instr;
+                            if(cluster->transactionInProgress) {
+                                cluster->core2.Stalled = 1;
+                                
+                            }
+                            else {
+                                
+                                cluster->cache2.blockStates[instr.loc] = IMD;
+                                cluster->request.type = GetM;
+                                cluster->request.sender = id;
+                                cluster->request.whichBlock = instr.loc;
+                                cluster->request.External = instr.external;
+                                cluster->request.fromHA = 0;
+                                cluster->isIssuingRequest = id;
+                                cluster->transactionInProgress = id;
+                                cluster->core2.Stalled = 1;
+                            }
+                            break;
+                        case Shared:
+                            cluster->core2.pendingInstruction = instr;
+                            if(cluster->transactionInProgress) {
+                                cluster->core2.Stalled = 1;
+                                
+                            }
+                            else {
+                                
+                                cluster->cache2.blockStates[instr.loc] = SMD;
+                                cluster->request.type = GetM;
+                                cluster->request.sender = id;
+                                cluster->request.whichBlock = instr.loc;
+                                cluster->request.External = instr.external;
+                                cluster->request.fromHA = 0;
+                                cluster->isIssuingRequest = id;
+                                cluster->transactionInProgress = id;
+                                cluster->core2.Stalled = 1;
+                            }
+                            break;
+                        case Modified:
+                            // NONPROD_ASSERT(0, "smoke test cluster->core2 modified no Trans in progress branch");
+                            
+                            cluster->cache2.dataBlocks[instr.loc][0] = instr.val;
+
+                            break;
+                        default:
+                            break;
                         }
                         break;
-                    case Shared:
-                        cluster->core2.registers[instr.regNum] = cluster->cache2.dataBlocks[instr.loc][0];
-                        break;
-                    case Modified:
-                        cluster->core2.registers[instr.regNum] = cluster->cache2.dataBlocks[instr.loc][0];
-                        break;
-                    default://TODO: Allow SMD to hit
-                        NONPROD_ASSERT(0, "atomic transaction violated");
-                        break;
-                    }
-                    break;
-                case Write:
-                    // NONPROD_ASSERT(0, "smoke test for write of core 2");
-                    switch (cluster->cache2.blockStates[instr.loc])
-                    {
-                    case Invalid:
+                    case Evict:
                         cluster->core2.pendingInstruction = instr;
                         if(cluster->transactionInProgress) {
                             cluster->core2.Stalled = 1;
                         }
-                        else {
-                            cluster->cache2.blockStates[instr.loc] = IMD;
-                            cluster->request.type = GetM;
+                        else {//issue PutM cluster->request, set cluster->transactionInProgress
+                            cluster->request.type = PutM;
                             cluster->request.sender = id;
                             cluster->request.whichBlock = instr.loc;
+                            cluster->request.External = instr.external;
+                            cluster->request.fromHA = 0;
                             cluster->isIssuingRequest = id;
+                            cluster->core2.Stalled = 1;
                             cluster->transactionInProgress = id;
-                            cluster->core2.Stalled = 1;
+                            
+                            cluster->cache2.blockStates[instr.loc] = Invalid;
                         }
-                        break;
-                    case Shared:
-                        cluster->core2.pendingInstruction = instr;
-                        if(cluster->transactionInProgress) {
-                            cluster->core2.Stalled = 1;
-                        }
-                        else {
-                            cluster->cache2.blockStates[instr.loc] = SMD;
-                            cluster->request.type = GetM;
-                            cluster->request.sender = id;
-                            cluster->request.whichBlock = instr.loc;
-                            cluster->isIssuingRequest = id;
-                            cluster->transactionInProgress = id;
-                            cluster->core2.Stalled = 1;
-                        }
-                        break;
-                    case Modified:
-                        cluster->cache2.dataBlocks[instr.loc][0] = instr.val;
                         break;
                     default:
+                        NONPROD_ASSERT(instr.type, "undef instruction type");
                         break;
-                    }
-                    break;
-                case Evict:
-                    cluster->core2.pendingInstruction = instr;
-                    if(cluster->transactionInProgress) {
-                        cluster->core2.Stalled = 1;
-                    }
-                    else {//issue PutM cluster->request, set cluster->transactionInProgress
-                        cluster->request.type = PutM;
-                        cluster->request.sender = id;
-                        cluster->request.whichBlock = instr.loc;
-                        cluster->isIssuingRequest = id;
-                        cluster->core2.Stalled = 1;
-                        cluster->transactionInProgress = id;
-                        cluster->cache2.blockStates[instr.loc] = Invalid;
-                    }
-                    break;
-                default:
-                    NONPROD_ASSERT(0, "unrecognised instruction type");
-                    break;
+                }
             }
+            
+            else{
+                switch(instr.type) {
+                    case Read:
+                        printf("instruction is read\n");
+                        switch (cluster->cache2.blockStates[instr.loc])
+                        {
+                        case Invalid:
+                            
+                            cluster->core2.pendingInstruction = instr;
+                            if(cluster->transactionInProgress) {//disallow PC to move to next instruction
+                                cluster->core2.Stalled = 1;       
+                            }
+                            else {
+                                cluster->request.type = GetS;
+                                cluster->request.sender = id;
+                                cluster->request.whichBlock = instr.loc;
+                                cluster->request.External = instr.external;
+                                cluster->request.fromHA = 0;
+                                cluster->isIssuingRequest = id;
+                                cluster->transactionInProgress = id;
+                                cluster->core2.Stalled = 1;
+                                if(instr.external) {
+                                    cluster->cache2.externalStates[instr.loc] = ISD;
+                                }
+                                else {
+                                    cluster->cache2.blockStates[instr.loc] = ISD;
+                                }
+                            }
+                            break;
+                        case Shared:
+                            if(instr.external)
+                                cluster->core2.registers[instr.regNum] = cluster->cache2.externalBlocks[instr.loc][0];
+                            else
+                                cluster->core2.registers[instr.regNum] = cluster->cache2.dataBlocks[instr.loc][0];
+                            break;
+                        case Modified:
+                            if(instr.external)
+                                cluster->core2.registers[instr.regNum] = cluster->cache2.externalBlocks[instr.loc][0];
+                            else
+                                cluster->core2.registers[instr.regNum] = cluster->cache2.dataBlocks[instr.loc][0];
+                            break;
+                        default://TODO: Allow SMD to hit
+                            NONPROD_ASSERT(0, "atomic transaction violated");
+                            break;
+                        }
+                        break;
+                    case Write:
+                        printf("instruction is write\n");
+                        
+                        switch (cluster->cache2.blockStates[instr.loc])
+                        {
+                        case Invalid:
+                            cluster->core2.pendingInstruction = instr;
+                            if(cluster->transactionInProgress) {
+                                cluster->core2.Stalled = 1;
+                                
+                            }
+                            else {
+                                if(instr.external)
+                                {
+                                    printf("core 1 external write should trigger this\n");
+                                    cluster->cache2.externalStates[instr.loc] = IMD;
+
+                                }
+                                else 
+                                    cluster->cache2.blockStates[instr.loc] = IMD;
+                                cluster->request.type = GetM;
+                                cluster->request.sender = id;
+                                cluster->request.whichBlock = instr.loc;
+                                cluster->request.External = instr.external;
+                                cluster->request.fromHA = 0;
+                                cluster->isIssuingRequest = id;
+                                cluster->transactionInProgress = id;
+                                cluster->core2.Stalled = 1;
+                            }
+                            break;
+                        case Shared:
+                            cluster->core2.pendingInstruction = instr;
+                            if(cluster->transactionInProgress) {
+                                cluster->core2.Stalled = 1;
+                                
+                            }
+                            else {
+                                // NONPROD_ASSERT(0, "smoke test cluster->core2 shared no Trans in progress branch");
+                                if(instr.external) {
+                                    cluster->cache2.externalStates[instr.loc] = SMD;
+                                }
+                                else
+                                    cluster->cache2.blockStates[instr.loc] = SMD;
+                                cluster->request.type = GetM;
+                                cluster->request.sender = id;
+                                cluster->request.whichBlock = instr.loc;
+                                cluster->request.External = instr.external;
+                                cluster->request.fromHA = 0;
+                                cluster->isIssuingRequest = id;
+                                cluster->transactionInProgress = id;
+                                cluster->core2.Stalled = 1;
+                            }
+                            break;
+                        case Modified:
+                            // NONPROD_ASSERT(0, "smoke test cluster->core2 modified no Trans in progress branch");
+                            if(instr.external)
+                                cluster->cache2.externalBlocks[instr.loc][0] = instr.val;
+                            else
+                                cluster->cache2.dataBlocks[instr.loc][0] = instr.val;
+
+                            break;
+                        default:
+                            break;
+                        }
+                        break;
+                    case Evict:
+                        cluster->core2.pendingInstruction = instr;
+                        if(cluster->transactionInProgress) {
+                            cluster->core2.Stalled = 1;
+                        }
+                        else {//issue PutM cluster->request, set cluster->transactionInProgress
+                            cluster->request.type = PutM;
+                            cluster->request.sender = id;
+                            cluster->request.whichBlock = instr.loc;
+                            cluster->request.External = instr.external;
+                            cluster->request.fromHA = 0;
+                            cluster->isIssuingRequest = id;
+                            cluster->core2.Stalled = 1;
+                            cluster->transactionInProgress = id;
+                            if(instr.external)
+                                cluster->cache2.externalStates[instr.loc] = Invalid;
+                            else
+                                cluster->cache2.blockStates[instr.loc] = Invalid;
+                        }
+                        break;
+                    default:
+                        NONPROD_ASSERT(instr.type, "undef instruction type");
+                        break;
+                }
+            }
+
+
+
         }
     }
 
@@ -776,6 +1848,10 @@ void core_reacts(int id, Cluster * cluster) {
         }
     }
     else {
+        //TODO: might want to skip executing new instructions if core_deal_with_previous_bus_msg had just completed a pending instruction?
+        //TODO: execute_instructions has places where blocks needs to be changed to external
+        printf("executing instructions at all?? %d, cluster addr: %d\n", id, cluster);
+        printf("%d, %d\n", cluster->program1.PC, cluster->program1.NumInstructions);
         execute_instruction(id, cluster);
     }
     update_PC(id, cluster);
@@ -784,6 +1860,7 @@ void core_reacts(int id, Cluster * cluster) {
 #ifdef DEBUG_MODE
 void cores_react(Cluster * cluster) {
     for(int i = 1; i <= NUM_CORES; i++) {
+        printf("follow2\n");
         core_reacts(i, cluster);
     }
 }
@@ -844,10 +1921,12 @@ void save_current_msg_for_next_cycle(Cluster * cluster) {
 void update_bus_msg_for_next_cycle(Cluster * cluster){
     // NONPROD_ASSERT(!(cluster->isIssuingRequest && isIssuingcluster->response), "cannot be issuing two to bus");
     if(cluster->isIssuingRequest){
+        printf("cluster issuing request, fromHA: %d, External %d\n", cluster->request.fromHA, cluster->request.External);
         cluster->snooping_bus= cluster->request;
         cluster->isIssuingRequest = 0;
     }
     else if(cluster->isIssuingResponse){
+        //printf("cluster got response from HA: %d, put on bus (external: %d) \n", cluster->response.fromHA, cluster->response.External);
         cluster->snooping_bus= cluster->response;
         cluster->isIssuingResponse = 0;
     }
@@ -862,7 +1941,11 @@ void mem_react(Cluster * cluster) {
     // PRINT("cycle %d \n", cluster->cycle);
     // PRINT2("memory react to message type %d, haspreviousbusmsg is %d\n", cluster->previousBusMsg.type, cluster->hasPreviousBusMsg);
     if(cluster->hasPreviousBusMsg) {
+        if(cluster->previousBusMsg.External) {
+            return; //ignore messages about external 
+        }
         // PRINT("mem is reacting to %d\n", cluster->previousBusMsg.type);
+
         blockId = cluster->previousBusMsg.whichBlock;
         switch(cluster->previousBusMsg.type) 
         {
@@ -933,8 +2016,57 @@ void mem_react(Cluster * cluster) {
     // cluster->hasPreviousBusMsg = 0;
 }
 
+void single_cluster_simulate(Cluster * cluster) {
+    while(cluster->cycle < 30) {
+        cores_react(cluster);
+        mem_react(cluster);
+        save_current_msg_for_next_cycle(cluster);
+        update_bus_msg_for_next_cycle(cluster);
+        cluster->cycle++;
+        if(cluster->program1.PC >= cluster->program1.NumInstructions && cluster->program2.PC >= cluster->program2.NumInstructions && !cluster->core1.Stalled && !cluster->core2.Stalled && !cluster->transactionInProgress)
+            break;
+        
+    }
+}
 
 
+
+
+//adds an instruction to program memory: assumes correct NumInstructions for existing instructions
+void fill_program(Cluster * cluster, Instruction * instr, int coreId) {
+    if(coreId == 1) {   
+        printf("printing core 1 program fill\n");
+        cluster->program1.instructions[cluster->program1.NumInstructions].type = instr->type;
+        cluster->program1.instructions[cluster->program1.NumInstructions].val = instr->val;
+        cluster->program1.instructions[cluster->program1.NumInstructions].loc = instr->loc;
+        cluster->program1.instructions[cluster->program1.NumInstructions].regNum = instr->regNum;
+        cluster->program1.instructions[cluster->program1.NumInstructions].external = instr->external;
+        cluster->program1.NumInstructions++;
+    }
+    if(coreId == 2) {
+        printf("printing core 2 program fill\n");
+        cluster->program2.instructions[cluster->program2.NumInstructions].type = instr->type;
+        cluster->program2.instructions[cluster->program2.NumInstructions].val = instr->val;
+        cluster->program2.instructions[cluster->program2.NumInstructions].loc = instr->loc;
+        cluster->program2.instructions[cluster->program2.NumInstructions].regNum = instr->regNum;
+        cluster->program2.instructions[cluster->program2.NumInstructions].external = instr->external;
+        cluster->program2.NumInstructions++;
+    }
+}
+
+Instruction * create_instruction(int external, 
+                                InstructionType type, 
+                                int loc, 
+                                int val, 
+                                int regNum) {
+    Instruction * i = (Instruction * ) malloc (sizeof(Instruction));
+    i->loc = loc;
+    i->type = type;
+    i->val = val;
+    i->regNum = regNum;
+    i->external = external;
+    return i;
+}
 
 
 

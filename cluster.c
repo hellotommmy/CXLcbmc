@@ -1,24 +1,14 @@
-#include "cluster.h"
-void single_cluster_simulate(Cluster * cluster) {
-    while(cluster->cycle < 30) {
-        cores_react(cluster);
-        mem_react(cluster);
-        save_current_msg_for_next_cycle(cluster);
-        // PRINT("HA%d\n", cluster->program2);
-        // PRINT2("hasPreviousBusmsg: %d, previousBusMsg type: %d\n", cluster->hasPreviousBusMsg, cluster->previousBusMsg.type);
-        // PRINT2("Who sent message: %d, for which block: %d (0-X, 1-Y), ", cluster->previousBusMsg.sender, cluster->previousBusMsg.whichBlock);
-        // PRINT("For whom: %d \n", cluster->previousBusMsg.receiver);
-        update_bus_msg_for_next_cycle(cluster);
-        if(cluster->program1.PC >= cluster->program1.NumInstructions && cluster->program2.PC >= cluster->program2.NumInstructions && !cluster->core1.Stalled && !cluster->core2.Stalled && !cluster->transactionInProgress)
-            break;
-        
-        cluster->cycle++;
-    }
-}
+// #include "cluster.h"
+#include "cxl_units.h"
 
-void verify_TSO_properties(Cluster * cluster) {
-        // IMPORTANT_ASSERT(cluster->program1.NumInstructions + 1 >= cluster->program1.PC >= cluster->program1.NumInstructions &&cluster->program2.NumInstructions + 1 >=cluster->program2.PC >=cluster->program2.NumInstructions, "finished all instructions");
+
+void verify_TSO_properties_single_cluster(Cluster * cluster) {
     // IMPORTANT_ASSERT(cluster->program1.NumInstructions + 1 >= cluster->program1.PC >= cluster->program1.NumInstructions &&cluster->program2.NumInstructions + 1 >=cluster->program2.PC >=cluster->program2.NumInstructions, "finished all instructions");
+    // IMPORTANT_ASSERT(cluster->program1.NumInstructions + 1 >= cluster->program1.PC >= cluster->program1.NumInstructions &&cluster->program2.NumInstructions + 1 >=cluster->program2.PC >=cluster->program2.NumInstructions, "finished all instructions");
+    initialise_cluster(cluster);
+    TSO_single_cluster(cluster);
+
+    single_cluster_simulate(cluster);
 
     NONPROD_ASSERT(cluster->cycle < 30, "didn't hit cluster->program2 maximum 30");
     IMPORTANT_ASSERT(cluster->program1.NumInstructions + 1 >= cluster->program1.PC, "program 1 PC not too far beyond last instruction");
@@ -41,6 +31,9 @@ void verify_TSO_properties(Cluster * cluster) {
 
 
 
+
+
+
 int main() {
     
     
@@ -48,12 +41,9 @@ int main() {
 
     //TSO litmus test
     Cluster * cluster1 = (Cluster *) malloc(sizeof(Cluster));
-    
-    TSO(cluster1);
-    initialise_cluster(cluster1);
 
-    single_cluster_simulate(cluster1);
-    verify_TSO_properties(cluster1);
+
+    verify_TSO_properties_single_cluster(cluster1);
 
 
     //random reads and write
