@@ -149,6 +149,7 @@ typedef struct {
     int isIssuingRequest;
     int transactionInProgress;
     int cycle;
+    int clusterId;
 } Cluster;
 
 typedef enum {
@@ -410,11 +411,36 @@ void cache_deal_OwnPutM(int id, Cluster * cluster) {
         ;//I have sent out PutM, now follow-up with Data message
     }
 }
+
+int get_tracker_id(Cluster * cluster) {
+    int trackerId = 8964;
+    if(cluster->clusterId == 1)
+    {        
+        for(int i = 0; i <= trackersCount1 - 1; i++ ) {
+            printf("cluster1Trackers[i].blockNum: %d ,cluster->previousBusMsg.whichBlock: %d, cluster->snooping_bus.whichBlock: %d\n", 
+                cluster1Trackers[i].blockNum, cluster->previousBusMsg.whichBlock, cluster->snooping_bus.whichBlock);
+            if(cluster1Trackers[i].blockNum == cluster->previousBusMsg.whichBlock) {
+                trackerId = i;
+                break;
+            }
+        }
+    }
+    else {
+        for(int i = 0; i <= trackersCount2 - 1; i++ ) {
+            if(cluster2Trackers[i].blockNum == cluster->previousBusMsg.whichBlock) {
+                trackerId = i;
+                break;
+            }
+        }
+    }
+    return trackerId;
+}
 void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
     // PRINT2("%d, %d\n", cluster->hasPreviousBusMsg, cluster->previousBusMsg.type);
     int thisBlock;
     Instruction pending;
     int trackerId;
+    int clusterId = cluster->clusterId;
     thisBlock = cluster->previousBusMsg.whichBlock;
     if(id == 1) {
         if(cluster->hasPreviousBusMsg){
@@ -434,10 +460,11 @@ void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
                                 cluster->response.fromHA = 0;
                                 cluster->response.sender = 1; //cluster 1
                                 cluster->response.toMem = 0;
-                                cluster->response.receiver = 0; //indicating to Host, not to other cores
+                                cluster->response.receiver = NUM_CORES + 1; //indicating to Host, not to other cores
                                 cluster->response.whichBlock = thisBlock;
                                 cluster->response.payload[0] = cluster->cache1.externalBlocks[thisBlock][0];
                                 cluster->response.payload[1] = cluster->cache1.externalBlocks[thisBlock][1];
+                                cluster->response.type = Data;
 
                                 break;
                             case Modified:
@@ -447,11 +474,13 @@ void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
                                 cluster->response.fromHA = 0;
                                 cluster->response.sender = 1; //cluster 1
                                 cluster->response.toMem = 0;
-                                cluster->response.receiver = 0; //indicating to host, not for other cores
+                                cluster->response.receiver = NUM_CORES + 1; //indicating to host, not for other cores
                                 cluster->response.whichBlock = thisBlock;
                                 cluster->cache1.externalStates[thisBlock] = Shared; //downgrade state to shared
                                 cluster->response.payload[0] = cluster->cache1.externalBlocks[thisBlock][0];
                                 cluster->response.payload[1] = cluster->cache1.externalBlocks[thisBlock][1];
+                                cluster->response.type = Data;
+                                
                                 break;
                             default:
                                 break;
@@ -469,19 +498,22 @@ void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
                             cluster->isIssuingResponse = 1;
                             cluster->response.External = 1;
                             cluster->response.fromHA = 0;
-                            cluster->response.sender = 1; //cluster 1
+                            cluster->response.sender = 1; //core 1
                             cluster->response.receiver = 2; //cluster 2 requested this
                             cluster->response.toMem = 0;
                             cluster->response.whichBlock = thisBlock;
                             cluster->response.payload[0] = cluster->cache1.externalBlocks[thisBlock][0];
                             cluster->response.payload[1] = cluster->cache1.externalBlocks[thisBlock][1];
+                            cluster->response.type = Data;
 
                             break;
                         case Modified:
+                            cluster->response.type = Data;
+
                             cluster->isIssuingResponse = 1;
                             cluster->response.External = 1;
                             cluster->response.fromHA = 0;
-                            cluster->response.sender = 1; //cluster 1
+                            cluster->response.sender = 1; //core 1
                             cluster->response.receiver = 2; //cluster 2 wanted this
                             cluster->response.toMem = 0;
                             cluster->response.whichBlock = thisBlock;
@@ -524,17 +556,22 @@ void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
                                 cluster->response.fromHA = 0;
                                 cluster->response.sender = 1; //cluster 1
                                 cluster->response.toMem = 0;
-                                cluster->response.receiver = 0; //indicating to host, not for other cores
+                                cluster->response.receiver = NUM_CORES + 1; //indicating to host, not for other cores
                                 cluster->response.whichBlock = thisBlock;
                                 cluster->response.payload[0] = cluster->cache1.externalBlocks[thisBlock][0];
                                 cluster->response.payload[1] = cluster->cache1.externalBlocks[thisBlock][1];
+                                cluster->response.type = Data;
+                                
                                 break;
                             default:
                                 break;
 
                         }
                     }
-                    else {//if bus message from own core, ignore. Otherwise search for the block and reply
+                    else {
+                        //if bus message from within cluster, try to resolve within cluster.
+                        //if message was issued from own core, ignore. 
+                        //Otherwise search for the block and reply
                         if(cluster->previousBusMsg.sender == id)
                             break;//ignore
                         switch (cluster->cache1.externalStates[thisBlock])
@@ -575,26 +612,14 @@ void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
                         }
 
                     }
-                    break;
-
-
-
-
-
-
                     break;//ignore: transaction about HA memory
                 case PutM:
                     break;//ignore: transaction to HA
                 case Data:
                     printf("smoke data\n");
-                    trackerId = 8964;
-                    for(int i = 0; i <= trackersCount1 - 1; i++ ) {
-                        if(cluster1Trackers[i].blockNum == cluster->snooping_bus.whichBlock) {
-                            trackerId = i;
-                            break;
-                        }
-                    }
-                    printf("trackerId is %d, dataArrivesBeforeGO is %d\n", trackerId, cluster1Trackers[trackerId].DataArrivedBeforeGO);
+                    trackerId = get_tracker_id(cluster);
+                    
+                    printf("1 trackerId is %d, dataArrivesBeforeGO is %d\n", trackerId, cluster1Trackers[trackerId].DataArrivedBeforeGO);
                     //TODO: revise the blockId part of cxl_units.h for dcoh_acts,trackerId instead of blockId
 
 
@@ -672,17 +697,9 @@ void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
                     //TODO:  complete transaction: do write/read for this location
                     //copy data into cache
                     NONPROD_ASSERT(0, "smoke GO_CXL core 1");
-                    trackerId = 8964;
-                    //TODO: We assume a tracker already exists, but have we made sure
-                    //all dcoh_acts clauses allocate a tracker whenever an External 
-                    //coherence transaction is initiated?
-                    for(int i = 0; i <= trackersCount1 - 1; i++ ) {
-                        if(cluster1Trackers[i].blockNum == cluster->snooping_bus.whichBlock) {
-                            trackerId = i;
-                            break;
-                        }
-                    }
-                    printf("%d, %d, trackerId at GO_CXL clause: %d\n", cluster->previousBusMsg.receiver, id, trackerId);
+                    trackerId = get_tracker_id(cluster);
+                    printf("core 1, receiver is core %d, current executing core is %d, trackerId at GO_CXL clause: %d, trackersCount is %d, tracker is tracking block %d\n", cluster->previousBusMsg.receiver, id, trackerId, trackersCount1, cluster1Trackers[0].blockNum);
+                    printf("snooping_bus block id %d, previousBusMsg block id%d\n", cluster->snooping_bus.whichBlock, cluster->previousBusMsg.whichBlock);
                     if(cluster->previousBusMsg.receiver != id){
                         break;
                     }
@@ -763,6 +780,7 @@ void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
                 }            
                 return;
             }
+            //message is about memory inside cluster, not host memory, not about CXL.
             switch (cluster->previousBusMsg.type)//this part deals with internal messages
             {
             case GetS:
@@ -850,22 +868,24 @@ void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
                                 cluster->isIssuingResponse = 1;
                                 cluster->response.External = 1;
                                 cluster->response.fromHA = 0;
-                                cluster->response.sender = 2; //cluster 2
+                                cluster->response.sender = 2; //core 2
                                 cluster->response.toMem = 0;
-                                cluster->response.receiver = 0; //indicating to Host, not to other cores
+                                cluster->response.receiver = NUM_CORES + 1; //indicating to Host, not to other cores
                                 cluster->response.whichBlock = thisBlock;
                                 cluster->response.payload[0] = cluster->cache2.externalBlocks[thisBlock][0];
                                 cluster->response.payload[1] = cluster->cache2.externalBlocks[thisBlock][1];
+                                cluster->response.type = Data;
 
                                 break;
                             case Modified:
+                                cluster->response.type = Data;
 
                                 cluster->isIssuingResponse = 1;
                                 cluster->response.External = 1;
                                 cluster->response.fromHA = 0;
-                                cluster->response.sender = 2; //cluster 2
+                                cluster->response.sender = 2; //core 2
                                 cluster->response.toMem = 0;
-                                cluster->response.receiver = 0; //indicating this message is for host, not for other cores
+                                cluster->response.receiver = NUM_CORES + 1; //indicating this message is for host, not for other cores
                                 cluster->response.whichBlock = thisBlock;
                                 cluster->cache2.externalStates[thisBlock] = Shared; //downgrade state to shared
                                 cluster->response.payload[0] = cluster->cache2.externalBlocks[thisBlock][0];
@@ -887,25 +907,28 @@ void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
                             cluster->isIssuingResponse = 1;
                             cluster->response.External = 1;
                             cluster->response.fromHA = 0;
-                            cluster->response.sender = 2; //cluster 2
+                            cluster->response.sender = 2; //core 2
                             cluster->response.receiver = 1; //cluster 1 requested this
                             cluster->response.toMem = 0;
                             cluster->response.whichBlock = thisBlock;
                             cluster->response.payload[0] = cluster->cache2.externalBlocks[thisBlock][0];
                             cluster->response.payload[1] = cluster->cache2.externalBlocks[thisBlock][1];
+                            cluster->response.type = Data;
 
                             break;
                         case Modified:
                             cluster->isIssuingResponse = 1;
                             cluster->response.External = 1;
                             cluster->response.fromHA = 0;
-                            cluster->response.sender = 2; //cluster 2
+                            cluster->response.sender = 2; //core 2
                             cluster->response.receiver = 1; //cluster 1 wanted this
                             cluster->response.toMem = 0;
                             cluster->response.whichBlock = thisBlock;
                             cluster->cache2.externalStates[thisBlock] = Shared; //downgrade state to shared
                             cluster->response.payload[0] = cluster->cache2.externalBlocks[thisBlock][0];
                             cluster->response.payload[1] = cluster->cache2.externalBlocks[thisBlock][1];
+                            cluster->response.type = Data;
+                            
                             break;
                         default:
                             break;
@@ -914,11 +937,15 @@ void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
                     }
                     break;//ignore
                 case GetM:
+                    printf("GetM clause activated in core_deal_with_previous_bus_message\n");
                     if(cluster->previousBusMsg.fromHA) {//if bus message from HA, reply with data
+                        printf("And it is from HA\n");
                         switch(cluster->cache2.externalStates[thisBlock]) {
                             case Invalid:
+                                printf("MESI ---I\n");
                                 break; //ignore, i don't have a copy
                             case Shared:
+                                printf("MESI----S\n");
                                 //invalidate myself, don't have to send data as I am not responsible
                                 //for sending the most up-to-date copy of the data, the Host is responsible
                                 cluster->cache2.externalStates[thisBlock] = Invalid;
@@ -934,6 +961,7 @@ void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
 
                                 break;
                             case Modified:
+                                printf("MESI----M\n");
                                 //I need to send dirty data to host, to be relayed to the
                                 //requestor device
                                 cluster->cache2.externalStates[thisBlock] = Invalid;
@@ -942,8 +970,9 @@ void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
                                 cluster->response.fromHA = 0;
                                 cluster->response.sender = 2; //cluster 2
                                 cluster->response.toMem = 0;
-                                cluster->response.receiver = 0; //indicating to host, not for other cores
+                                cluster->response.receiver = NUM_CORES + 1; //indicating to host, not for other cores
                                 cluster->response.whichBlock = thisBlock;
+                                cluster->response.type = Data;
                                 cluster->response.payload[0] = cluster->cache2.externalBlocks[thisBlock][0];
                                 cluster->response.payload[1] = cluster->cache2.externalBlocks[thisBlock][1];
                                 break;
@@ -1005,14 +1034,8 @@ void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
                     break;//ignore: transaction to HA
                 case Data:
                     printf("smoke data\n");
-                    trackerId = 8964;
-                    for(int i = 0; i <= trackersCount1 - 1; i++ ) {
-                        if(cluster1Trackers[i].blockNum == cluster->snooping_bus.whichBlock) {
-                            trackerId = i;
-                            break;
-                        }
-                    }
-                    printf("trackerId is %d, dataArrivesBeforeGO is %d\n", trackerId, cluster1Trackers[trackerId].DataArrivedBeforeGO);
+                    trackerId = get_tracker_id(cluster);
+                    printf("2 trackerId is %d, dataArrivesBeforeGO is %d\n", trackerId, cluster1Trackers[trackerId].DataArrivedBeforeGO);
                     //TODO: revise the blockId part of cxl_units.h for dcoh_acts,trackerId instead of blockId
 
 
@@ -1095,12 +1118,12 @@ void core_deal_with_previous_bus_msg(int id, Cluster * cluster) {
                     //all dcoh_acts clauses allocate a tracker whenever an External 
                     //coherence transaction is initiated?
                     for(int i = 0; i <= trackersCount1 - 1; i++ ) {
-                        if(cluster1Trackers[i].blockNum == cluster->snooping_bus.whichBlock) {
+                        if(cluster1Trackers[i].blockNum == cluster->previousBusMsg.whichBlock) {
                             trackerId = i;
                             break;
                         }
                     }
-                    printf("%d, %d, trackerId at GO_CXL clause: %d\n", cluster->previousBusMsg.receiver, id, trackerId);
+                    printf("2 %d, %d, trackerId at GO_CXL clause: %d\n", cluster->previousBusMsg.receiver, id, trackerId);
                     if(cluster->previousBusMsg.receiver != id){
                         break;
                     }

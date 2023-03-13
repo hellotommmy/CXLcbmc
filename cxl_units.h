@@ -57,6 +57,9 @@ typedef struct {
 typedef struct {
     H2DRequestType snoopType;
     HABlockTypes cachelineTypeBeforeSnoop;
+    int UQID;
+    int requestorCluster;
+    int requestorCore;
 
 
 } CXLTempTracker;
@@ -304,6 +307,7 @@ void HA_acts() {
                         if(!Host.stateBitVector[blockId][0]) {
                             //TODO: if not owned, can send data from HA now??
                             //TODO: check the meaning of Data "ordering with other transactions"
+                            printf("sending data to requestor from HA\n");
                             H2DDataToIssue1.payload[0] = Host.dataBlocks[blockId][0];
                             H2DDataToIssue1.payload[1] = Host.dataBlocks[blockId][1];
                             isIssuingH2DData1 = 1;
@@ -316,7 +320,7 @@ void HA_acts() {
                         else {
                             //someone other than 1 owns data!
                             printf("invalidate owner!\n");
-                            isIssuingH2DReq1 = 1;
+                            isIssuingH2DReq2 = 1;
                             //currently "other" can only be 2
                             NONPROD_ASSERT(Host.stateBitVector[blockId][2], "only 1 owner in MESI protocol, should be 2 since 1 is requesting");
                             generate_H2DReq(&D2HReqToProcess1, &H2DReqToIssue2);
@@ -576,10 +580,11 @@ void HA_acts() {
 
 
 
-    if(prevD2HRespBusy2) {//if a device has a response sent to host, need to consume that response
+    if(prevD2HRespBusy2) {
+        //if a device has a response sent to host, need to consume that response
         //remember the block, if block under coherence transaction, postpone dealing with current D2HReq
         int blockId = D2HRespToProcess2.whichBlock;
-        int trackerId = 0;
+        int trackerId = 8964;
         for(int i = 0; i < trackersCountHome; i++) {
             if(HomeTrackers[i].blockNum == blockId) {
                 //delay processing if exists an ongoing transaction for same blockId
@@ -593,6 +598,8 @@ void HA_acts() {
         }
         switch(D2HRespToProcess2.type) {
             case RspIHitSE:
+                //TODO: when no data sent, should not expect any data be sent 
+                //a transaction should be complete by GO in RspXFwdY shaped msgs
                 generate_H2DResp_from_tracker(&HomeTrackers[trackerId], &H2DRespToIssue1);
                 isIssuingH2DResp1 = 1;
                 if(Host.stateBitVector[blockId][0]) {
@@ -600,7 +607,10 @@ void HA_acts() {
                     //if the D2HResp sender was owner, RspIHitSE indicates no data will be forwarded
                     //need host to send data instead (because responder was in E state, which is clean)
                     //TODO: send data
-                    generate_H2DData_from_HA(&H2DDataToIssue1, blockId, &H2DRespToIssue1);
+                    //commented this below line because RspIHitSE indicates 
+                    //no data shall be sent
+                    //generate_H2DData_from_HA(&H2DDataToIssue1, blockId, &H2DRespToIssue1);
+                    
                     isIssuingH2DData1 = 1;
                     //TODO: set bitvector
                     
@@ -624,6 +634,43 @@ void HA_acts() {
                 }
                 break;
             case RspSHitSE:
+                
+                break;
+            case RspIFwdM: 
+                printf("RspIFwdM response received from device 2. TrackerId is %d\n", trackerId);
+                generate_H2DResp_from_tracker(&HomeTrackers[trackerId], &H2DRespToIssue1);
+                isIssuingH2DResp1 = 1;
+                if(Host.stateBitVector[blockId][0]) {
+                    printf("state bit vector 0 is non-zero\n");
+                    NONPROD_ASSERT(Host.stateBitVector[blockId][0] == 2, "owner bit should be kept set to cluster 2 before cluster 2 response is processed");
+                    //if the D2HResp sender was owner, RspIHitSE indicates no data will be forwarded
+                    //need host to send data instead (because responder was in E state, which is clean)
+                    //TODO: send data
+                    // generate_H2DData_from_HA(&H2DDataToIssue1, blockId, &H2DRespToIssue1);
+                    // isIssuingH2DData1 = 1;
+                    //TODO: set bitvector
+                    
+                }
+                if(H2DRespToIssue1.MESI_State == MESI_E || H2DRespToIssue1.MESI_State == MESI_M) {
+                    printf("cluster 1 granted ownership of block %d\n", blockId);
+                    Host.stateBitVector[blockId][0] = 1; //change owner to cluster 1
+                }
+                else {
+                    Host.stateBitVector[blockId][0] = 0; //no one is owner now: 1 is not, 2 has been downgraded
+                }
+                Host.stateBitVector[blockId][1] = 1; //cluster1 has a valid copy now
+                Host.stateBitVector[blockId][2] = 0; //cluster2 has become invalid now
+                Host.existsValidCopy[blockId] = 1;
+                if(HomeTrackers[trackerId].DataArrivedBeforeGO) {//data + response both arrived for the snoop,
+                    //no need for host to keep the tracker, transaction complete from host's pov
+                    deallocate_tracker(trackerId);
+                }
+                else {
+                    //2 to indicate data has not arrived yet, GO is sent first
+                    //TODO: When no data, no need for sending data and this logic
+                    printf("Data arrives after GO\n");
+                    HomeTrackers[trackerId].DataArrivedBeforeGO = 2;
+                }
                 break;
             default:
                 break;
@@ -637,6 +684,24 @@ void HA_acts() {
 
     
     }
+
+
+
+    if(prevD2HDataBusy2) {
+        //if previous cycle some D2H data was on the channel, now take into host
+        //and send to the right requestor cluster
+        printf("payloads:[%d], [%d]\n", D2HDataToProcess2.payload[0], D2HDataToProcess2.payload[1]);
+        isIssuingH2DData1 = 1;
+        H2DDataToIssue1.CQID = D2HDataToProcess2.UQID;
+        H2DDataToIssue1.payload[0] = D2HDataToProcess2.payload[0];
+        H2DDataToIssue1.payload[1] = D2HDataToProcess2.payload[1];
+        H2DDataToIssue1.requestorCluster = D2HDataToProcess2.requestorCluster;
+        H2DDataToIssue1.requestorCore = D2HDataToProcess2.requestorCore;
+        H2DDataToIssue1.whichBlock = D2HDataToProcess2.whichBlock;        
+        
+
+    }
+
 
 
 
@@ -706,7 +771,14 @@ void DCOH_acts(Cluster * cluster, int id) {
                 //TODO: make sure H2D Data is translated into the right type (i.e. Data, not GO_CXL)
                 cluster->response.type = Data; 
                 cluster->response.whichBlock = H2DDataToProcess1.whichBlock;
+                printf("payl1 %d, payl2 %d\n", cluster->response.payload[0], cluster->response.payload[1]);
+
+                printf("cluster->response.whichBlock is %d\n", cluster->response.whichBlock);
+                //TODO: actual place prevH2DDataBlocked1 should be set to 0:
+                //after cluster transaction completes. Rather than here:
                 prevH2DDataBlocked1 = 0;
+                //H2D Data was received and taken into cluster. it still takes time
+                //for the data to arrive into the core.
             }
 
             //break;
@@ -734,11 +806,14 @@ void DCOH_acts(Cluster * cluster, int id) {
                 cluster->request.toMem = 0;
                 cluster->request.fromHA = 1; //msg flowing from HA to cluster
                 TempTracker1.snoopType = H2DReqToProcess1.type;
+                TempTracker1.UQID = H2DReqToProcess1.UQID;
+
                 isIssuingD2HData1 = 1;
                 
                 TempTracker1.cachelineTypeBeforeSnoop = DCOH1[H2DReqToProcess1.whichBlock];//
                 
-
+                TempTracker1.requestorCluster = H2DReqToProcess1.requestorCluster;
+                TempTracker1.requestorCore = H2DReqToProcess1.requestorCore;
                 switch(H2DReqToProcess1.type) {
                 case SnpInv:
                     cluster->request.type = GetM;
@@ -774,13 +849,17 @@ void DCOH_acts(Cluster * cluster, int id) {
             printf("Idle: %d, External: %d, fromHA %d\n", cluster->snooping_bus.type, cluster->snooping_bus.External, cluster->snooping_bus.fromHA);
             return; //DA only acts if bus message is external message, and the message is flowing from cluster to HA, not from HA
         } 
-        if(DCOH1[blockId] == MESI_E || DCOH1[blockId] == MESI_M)
+        if(cluster->snooping_bus.receiver == 1 || cluster->snooping_bus.receiver == 2){
+            //TODO: check all messages receiver 1 or 2 indicate intra-cluster messages
+            //message definitely for host, not other core within cluster
+            printf("returned 2\n");
             return; //when cluster has high privilige access, resolve internal coherence messages within cluster, no need to notify host
+        }
         //deal with message on snooping bus
         switch(cluster->snooping_bus.type) {
             case GetS:
                 
-                if(DCOH1[blockId] == MESI_S)
+                if(DCOH1[blockId] != MESI_I)
                     break;
                 //
                 isIssuingD2HReq1 = 1;
@@ -803,6 +882,8 @@ void DCOH_acts(Cluster * cluster, int id) {
 
                 break;
             case GetM:
+                if(DCOH1[blockId] == MESI_E || DCOH1[blockId] == MESI_M)
+                    break;
                 printf("DCOH dealing with bus message GetM\n");
                 isIssuingD2HReq1 = 1;
                 D2HReqToIssue1.type = RdOwn;
@@ -822,26 +903,27 @@ void DCOH_acts(Cluster * cluster, int id) {
                             
                 break;
             case Data:
-                printf("d2h data from data to host sent at internal bus\n");
+                
+                printf("d2h data from data to host sent at internal bus 1\n");
                 //two things to issue: data and response. On a separate channel.
                 isIssuingD2HData1 = 1;
-                int trackerId = 8964;
-                for(int i = 0; i <= trackersCount1 - 1; i++ ) {
-                    if(cluster1Trackers[i].blockNum == cluster->snooping_bus.whichBlock) {
-                        trackerId = i;
-                        break;
-                    }
-                }
-                NONPROD_ASSERT(trackerId != 8964, "a tracker should have been allocated");
+                // int trackerId = 8964;
+                // for(int i = 0; i <= trackersCount1 - 1; i++ ) {
+                //     if(cluster1Trackers[i].blockNum == cluster->snooping_bus.whichBlock) {
+                //         trackerId = i;
+                //         break;
+                //     }
+                // }
+                // NONPROD_ASSERT(trackerId != 8964, "a tracker should have been allocated");
                 //TODO: make sure a tracker was allocated at beginning of an external coherence transaction (request from HA)
-                D2HDataToIssue1.UQID = cluster1Trackers[trackerId].CQID;
+                D2HDataToIssue1.UQID = TempTracker1.UQID;
                 D2HDataToIssue1.payload[0] = cluster->snooping_bus.payload[0];
                 D2HDataToIssue1.payload[1] = cluster->snooping_bus.payload[1];
-                D2HDataToIssue1.requestorCluster = cluster1Trackers[trackerId].requestorCluster;
-                D2HDataToIssue1.requestorCore = cluster1Trackers[trackerId].requestorCore;
+                D2HDataToIssue1.requestorCluster = TempTracker1.requestorCluster;
+                D2HDataToIssue1.requestorCore = TempTracker1.requestorCore;
 
                 isIssuingD2HResp1 = 1;
-                D2HRespToIssue1.CQID = cluster1Trackers[trackerId].CQID;
+                D2HRespToIssue1.CQID = TempTracker1.UQID;
                 D2HRespToIssue1.requestorCluster = D2HDataToIssue1.requestorCluster;
                 D2HRespToIssue1.requestorCore = D2HDataToIssue1.requestorCore;
                 D2HRespToIssue1.whichBlock = cluster->snooping_bus.whichBlock;
@@ -1007,10 +1089,19 @@ void DCOH_acts(Cluster * cluster, int id) {
                 cluster->request.sender = H2DReqToProcess2.requestorCluster; //here sender indicates cluster not core
                 cluster->request.toMem = 0;
                 cluster->request.fromHA = 1; //msg flowing from HA to cluster
-                if(H2DReqToProcess2.type == SnpInv)
+                TempTracker2.snoopType = H2DReqToProcess2.type;
+                TempTracker2.cachelineTypeBeforeSnoop = DCOH2[H2DReqToProcess2.whichBlock];
+                TempTracker2.UQID = H2DReqToProcess2.UQID;
+                TempTracker2.requestorCluster = H2DReqToProcess2.requestorCluster;
+                TempTracker2.requestorCore = H2DReqToProcess2.requestorCore;
+                if(H2DReqToProcess2.type == SnpInv){
+                    printf("GetM needed for SnpInv\n");
                     cluster->request.type = GetM;
-                else
+                }
+                else {
                     cluster->request.type = GetS;
+
+                }
                 cluster->request.whichBlock = H2DReqToProcess2.whichBlock;
                 prevH2DReqBlocked2 = 0;
                 
@@ -1029,8 +1120,9 @@ void DCOH_acts(Cluster * cluster, int id) {
             printf("Idle: %d, External: %d, fromHA %d\n", cluster->snooping_bus.type, cluster->snooping_bus.External, cluster->snooping_bus.fromHA);
             return; //DA only acts if bus message is external message, and the message is flowing from cluster to HA, not from HA
         } 
-        if(DCOH2[blockId] == MESI_E || DCOH2[blockId] == MESI_M){
-            printf("returned\n");
+        if(cluster->snooping_bus.receiver == 1 || cluster->snooping_bus.receiver == 2){ //message needs to be sent to host, 3 indicates that. 
+            //1-->core 1, 2----> core2, 3----> dcoh
+            printf("returned2\n");
             return; //when cluster has high privilige access, resolve internal coherence messages within cluster, no need to notify host
 
         }
@@ -1038,7 +1130,10 @@ void DCOH_acts(Cluster * cluster, int id) {
         switch(cluster->snooping_bus.type) {
             case GetS:
                 
-                if(DCOH2[blockId] == MESI_S)
+                //if the DCOH registers cache state in privilege higher than or equal to 
+                //coherence request, then resolve coherence within cluster, no need for
+                //DCOH to generate messages on D2H channels
+                if(DCOH2[blockId] != MESI_I)
                     break;
                 
                 isIssuingD2HReq2 = 1;
@@ -1059,6 +1154,8 @@ void DCOH_acts(Cluster * cluster, int id) {
 
                 break;
             case GetM:
+                if(DCOH2[blockId] == MESI_E || DCOH2[blockId] == MESI_M)
+                    break;
                 printf("DCOH dealing with bus message GetM\n");
                 isIssuingD2HReq2 = 1;
                 D2HReqToIssue2.type = RdOwn;
@@ -1078,26 +1175,28 @@ void DCOH_acts(Cluster * cluster, int id) {
                             
                 break;
             case Data:
-                printf("d2h data from data to host sent at internal bus\n");
+                printf("d2h data from data to host sent at internal bus 2\n");
                 //two things to issue: data and response. On a separate channel.
                 isIssuingD2HData2 = 1;
-                int trackerId = 8964;
-                for(int i = 0; i <= trackersCount2 - 1; i++ ) {
-                    if(cluster2Trackers[i].blockNum == cluster->snooping_bus.whichBlock) {
-                        trackerId = i;
-                        break;
-                    }
-                }
-                NONPROD_ASSERT(trackerId != 8964, "a tracker should have been allocated");
+                // int trackerId = 8964;
+                // for(int i = 0; i <= trackersCount2 - 1; i++ ) {
+                //     if(cluster2Trackers[i].blockNum == cluster->snooping_bus.whichBlock) {
+                //         trackerId = i;
+                //         break;
+                //     }
+                // }
+                // NONPROD_ASSERT(trackerId != 8964, "a tracker should have been allocated");
                 //TODO: make sure a tracker was allocated at beginning of an external coherence transaction (request from HA)
-                D2HDataToIssue2.UQID = cluster2Trackers[trackerId].CQID;
+                D2HDataToIssue2.UQID = TempTracker2.UQID;
                 D2HDataToIssue2.payload[0] = cluster->snooping_bus.payload[0];
                 D2HDataToIssue2.payload[1] = cluster->snooping_bus.payload[1];
-                D2HDataToIssue2.requestorCluster = cluster2Trackers[trackerId].requestorCluster;
-                D2HDataToIssue2.requestorCore = cluster2Trackers[trackerId].requestorCore;
+                
+                D2HDataToIssue2.requestorCluster =   TempTracker2.requestorCluster;
+                D2HDataToIssue2.requestorCore = TempTracker2.requestorCore;
+                D2HDataToIssue2.whichBlock = cluster->snooping_bus.whichBlock;
 
                 isIssuingD2HResp2 = 1;
-                D2HRespToIssue2.CQID = cluster2Trackers[trackerId].CQID;
+                D2HRespToIssue2.CQID = TempTracker2.UQID;
                 D2HRespToIssue2.requestorCluster = D2HDataToIssue2.requestorCluster;
                 D2HRespToIssue2.requestorCore = D2HDataToIssue2.requestorCore;
                 D2HRespToIssue2.whichBlock = cluster->snooping_bus.whichBlock;
@@ -1140,6 +1239,7 @@ void DCOH_acts(Cluster * cluster, int id) {
                             //TODO: RspIFwdM is also allowed, but not sure why and use case
                             break;
                         case SnpInv:
+                            printf("should hit SnpInv+M branch for test2, blockId is %d\n", D2HRespToIssue2.whichBlock);
                             D2HRespToIssue2.type = RspIFwdM;
                             break;
                         
@@ -1206,9 +1306,9 @@ void decide_DCOH_to_process_messages(int id) {
         } 
     }
     else {
-        printf("decide dcoh for cluster 2\n");
+        
         if(H2DReq2Counter > 0 && !prevH2DReqBlocked2) {
-            printf("taking h2dreq2 from channel to process\n");
+            
             H2DReqToProcess2 = H2DReq2[0];
             prevH2DReqBusy2 = 1;
             for(int i = 0; i < H2DReq2Counter - 1; i++) {
@@ -1233,7 +1333,7 @@ void decide_DCOH_to_process_messages(int id) {
     if(id == 1) {
         if(H2DResp1Counter > 0) {
             //TODO: nondet choose one of the H2D Respuests
-            printf("taking H2D response to consume\n");
+            
             H2DRespToProcess1 = H2DResp1[0];
             prevH2DRespBusy1 = 1;
             for(int i = 0; i < H2DResp1Counter - 1; i++) {
@@ -1248,6 +1348,7 @@ void decide_DCOH_to_process_messages(int id) {
 
     else {
         if(H2DResp2Counter > 0) {
+            printf("h2d response in channel to process\n");
             //TODO: nondet choose one of the H2D Respuests
             H2DRespToProcess2 = H2DResp2[0];
             prevH2DRespBusy2 = 1;
@@ -1349,6 +1450,9 @@ void cluster_acts(Cluster * cluster, int id) {
         printf("follow1 %d, cluster->program1.PC: %d, cluster->program1.NumInstructions: %d\n", cluster, cluster->program1.PC, cluster->program1.NumInstructions);
         cores_react(cluster);
     }
+
+    // if(cluster->previousBusMsg.type == Data)
+    //     printf("Data on bus before DCOH acts\n");
     // printf("a %d %d\n", globalCounter, cluster->cycle);
     
     DCOH_acts(cluster, id); //device agent deals with bus/channel messages (from previous cycle)
@@ -1436,6 +1540,7 @@ void decide_HA_to_process_messages() {
     }
 
     if(D2HResp2Counter > 0) {
+        printf("d2h resp sent from channel into host buffer\n");
         //TODO: nondet choose one of the D2H Respuests
         D2HRespToProcess2 = D2HResp2[0];
         prevD2HRespBusy2 = 1;
@@ -1510,6 +1615,7 @@ void update_cache_channels_messages() {
         isIssuingH2DResp1 = 0;
     }
     if(isIssuingH2DResp2) {
+        
         H2DResp2[H2DResp1Counter] = H2DRespToIssue2;
         H2DResp2Counter++;
         isIssuingH2DResp2 = 0;
@@ -1542,6 +1648,7 @@ void update_cache_channels_messages() {
         isIssuingD2HResp1 = 0;
     }
     if(isIssuingD2HResp2) {
+        printf("d2h response issued from device 2\n");
         D2HResp2[D2HResp1Counter] = D2HRespToIssue2;
         D2HResp2Counter++;
         isIssuingD2HResp2 = 0;
@@ -1752,8 +1859,9 @@ void initialise_channels() {
 }
 void initialise_HA() {
     for(int i = 0; i < MAX_BLOCKS_HA; i++){
-        Host.dataBlocks[i][0] = 0;
+        Host.dataBlocks[i][0] = 0; //block always filled with data 0 in byte 0, and 42 in byte 1
         Host.dataBlocks[i][1] = 42;
+
         Host.existsValidCopy[i] = 0;
         Host.stateBitVector[i][0] = 0; //is not owned by any peer caches
         //does not exist in any peer caches
@@ -1771,7 +1879,9 @@ void type1_test1() {
 
     //initialise clusters and host,
     initialise_cluster(cluster1);
+    cluster1->clusterId = 1;
     initialise_cluster(cluster2);
+    cluster1->clusterId = 2;
     initialise_HA();
     //initialise CXL.cache channels
     initialise_channels();
@@ -1806,7 +1916,9 @@ void type1_test2() {
 
     //initialise clusters and host,
     initialise_cluster(cluster1);
+    cluster1->clusterId = 1;
     initialise_cluster(cluster2);
+    cluster2->clusterId = 2;
     initialise_HA();
     //initialise CXL.cache channels
     initialise_channels();
@@ -1814,12 +1926,14 @@ void type1_test2() {
     init_DCOH();
 
     cluster2->cache2.externalStates[1] = Modified;
-    cluster2->cache2.externalBlocks[1][0] = 84;
-    cluster2->cache2.externalBlocks[1][1] = 42;
+    cluster2->cache2.externalBlocks[1][0] = 43;
+    cluster2->cache2.externalBlocks[1][1] = 84;
     
     Host.existsValidCopy[1] = 1; //block 1 has a valid copy (in clustser 2)
     Host.stateBitVector[1][2] = MESI_M; //cluster 2 has block 1 in M state
     Host.stateBitVector[1][0] = 2; //owner is cluster 2
+
+    DCOH2[1] = MESI_M;
     
     //Host.dataBlocks[1][1] 
     
@@ -1839,7 +1953,7 @@ void type1_test2() {
     //start running system with clusters and host
     type1_device_simulate(cluster1, cluster2, &Host);
     
-    IMPORTANT_ASSERT(cluster1->cache1.externalBlocks[1][0] == 84, "cache 1 of cluster 1 got block Y of HA");
-    IMPORTANT_ASSERT(cluster1->cache1.externalBlocks[1][1] == 42, "should have received data from HA");
+    IMPORTANT_ASSERT(cluster1->cache1.externalBlocks[1][0] == 1, "modified byte 0 of block Y on cache 1 of cluster 1");
+    IMPORTANT_ASSERT(cluster1->cache1.externalBlocks[1][1] == 84, "cache 1 of cluster 1 got block Y of HA");
 
 }
