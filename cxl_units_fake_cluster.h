@@ -1,4 +1,4 @@
-#include "cluster.h"
+#include "fake_cluster.h"
 // typedef struct {
 #define BYTES_PER_BLOCK_HA 2
 #define MAX_BLOCKS_HA 2
@@ -422,6 +422,9 @@ void HA_acts() {
                 case RdCurr://TODO: need handling of this request
                     ;
                     break;
+                case CleanEvict:
+                    break;
+                    
                 default:
                     break;
             }
